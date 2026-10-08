@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const require_run = require("./run-BFrtGU0F.cjs");
+const require_run = require("./run-CE-7LkaD.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 //#region packages/aperture-bot/src/main.ts

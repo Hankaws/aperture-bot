@@ -151789,6 +151789,47 @@ function withIdentifierNames(text) {
 	return text.replace(STRING_MODULE, (_all, head, quoted) => `${head}${name(quoted)}`).replace(BARE_STRING_MODULE, (_all, head, quoted) => `${head}${name(quoted)} {}`).replace(TYPEOF_IMPORT, (_all, head, call) => `${head}${name(call)}`);
 }
 /**
+* In JSX children, braces holding nothing or only a comment are valid (an
+* empty expression, the usual way to write a comment in JSX), but Lezer's
+* grammar wants an expression there: it marks an error before the closing
+* brace, and its recovery can carry the error into the lines after. True for
+* an error node inside a JSXEscape with only whitespace or comments between
+* the opening brace and it, and the closing brace next.
+*/
+function isEmptyJsxExpression(text, node) {
+	const escape = node.parent;
+	if (escape?.name !== "JSXEscape") return null;
+	return text.slice(escape.from + 1, node.from).replace(/\/\*[\s\S]*?\*\//g, "").trim() === "" && /^\s*\}/.test(text.slice(node.from)) ? escape : null;
+}
+/** At most this many empty JSX expressions are filled in, each with a parse. */
+const MAX_EMPTY_JSX = 200;
+/**
+* Parses `text`, filling each empty JSX expression with a `0` right after
+* its opening brace (found in the tree, so never an object literal) and
+* parsing again. No line break is added, so every line keeps its number.
+*/
+function parseFillingEmptyJsx(path, text) {
+	const parser = jsParserFor(path);
+	let source = text;
+	for (let round = 0;; round += 1) {
+		const tree = parser.parse(source);
+		if (round >= MAX_EMPTY_JSX) return {
+			tree,
+			text: source
+		};
+		let escape = null;
+		const cursor = tree.cursor();
+		do
+			if (cursor.type.isError) escape = isEmptyJsxExpression(source, cursor.node);
+		while (!escape && cursor.next());
+		if (!escape) return {
+			tree,
+			text: source
+		};
+		source = `${source.slice(0, escape.from + 1)}0${source.slice(escape.from + 1)}`;
+	}
+}
+/**
 * Parse errors, one per line at most.
 *
 * Lezer recovers and carries on, so a single mistake often yields a run of
@@ -151797,13 +151838,14 @@ function withIdentifierNames(text) {
 function scriptIssues(path, text) {
 	if (!text.trim()) return [];
 	if (text.length > MAX_PARSE_CHARS$2) return [];
-	let tree;
+	let parsed;
 	try {
-		tree = jsParserFor(path).parse(TS_EXT$1.test(path) ? withIdentifierNames(text) : text);
+		parsed = parseFillingEmptyJsx(path, TS_EXT$1.test(path) ? withIdentifierNames(text) : text);
 	} catch (error) {
 		return [error instanceof Error ? error.message.slice(0, 160) : "parse error"];
 	}
-	const starts = lineStarts$1(text);
+	const { tree } = parsed;
+	const starts = lineStarts$1(parsed.text);
 	const lines = /* @__PURE__ */ new Set();
 	const cursor = tree.cursor();
 	do
@@ -157981,7 +158023,7 @@ async function postChat(cfg, body, signal) {
 		}),
 		signal
 	};
-	const pinned = cfg.provider === "custom" ? await (await Promise.resolve().then(() => require("./custom-endpoint.server-DNZD7G5J.cjs"))).customEndpointFetch(base, "/chat/completions", init) : null;
+	const pinned = cfg.provider === "custom" ? await (await Promise.resolve().then(() => require("./custom-endpoint.server-DMtiCpyy.cjs"))).customEndpointFetch(base, "/chat/completions", init) : null;
 	const res = pinned?.response ?? await fetch(`${base}/chat/completions`, {
 		...init,
 		redirect: "manual"
