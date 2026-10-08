@@ -147508,7 +147508,7 @@ function testTampering(files, edits) {
 	return found;
 }
 //#endregion
-//#region ../../../../../../home/user/aperture/node_modules/@lezer/common/dist/index.js
+//#region node_modules/@lezer/common/dist/index.js
 /**
 The default maximum length of a `TreeBuffer` node.
 */
@@ -148947,7 +148947,7 @@ var StringInput = class {
 };
 new NodeProp({ perNode: true });
 //#endregion
-//#region ../../../../../../home/user/aperture/node_modules/@lezer/lr/dist/index.js
+//#region node_modules/@lezer/lr/dist/index.js
 /**
 A parse stack. These are used internally by the parser to track
 parsing progress. They also provide some properties and methods
@@ -150438,7 +150438,7 @@ function getSpecializer(spec) {
 	return spec.get;
 }
 //#endregion
-//#region ../../../../../../home/user/aperture/node_modules/@lezer/highlight/dist/index.js
+//#region node_modules/@lezer/highlight/dist/index.js
 let nextTagID = 0;
 /**
 Highlighting tags are markers that denote a highlighting category.
@@ -151217,7 +151217,7 @@ tagHighlighter([
 	}
 ]);
 //#endregion
-//#region ../../../../../../home/user/aperture/node_modules/@lezer/javascript/dist/index.js
+//#region node_modules/@lezer/javascript/dist/index.js
 const noSemi = 316;
 const noSemiType = 317;
 const incdec = 1;
@@ -157981,7 +157981,7 @@ async function postChat(cfg, body, signal) {
 		}),
 		signal
 	};
-	const pinned = cfg.provider === "custom" ? await (await Promise.resolve().then(() => require("./custom-endpoint.server-BoTS80Lt.cjs"))).customEndpointFetch(base, "/chat/completions", init) : null;
+	const pinned = cfg.provider === "custom" ? await (await Promise.resolve().then(() => require("./custom-endpoint.server-DNZD7G5J.cjs"))).customEndpointFetch(base, "/chat/completions", init) : null;
 	const res = pinned?.response ?? await fetch(`${base}/chat/completions`, {
 		...init,
 		redirect: "manual"
@@ -158119,6 +158119,44 @@ function toAnthropic(messages) {
 	};
 }
 //#endregion
+//#region packages/aperture-bot/src/retry.ts
+/**
+* One retry for a request sent on a connection the other side had already
+* closed. Node's fetch keeps connections open between requests; while the bot
+* waits on something that blocks the event loop (an image pull, a test run),
+* the server may close one without Node noticing, and the next request on it
+* fails before the server ever reads it. Retrying that request cannot repeat
+* one that arrived, so it is safe for a comment or a pull request too.
+*/
+const STALE = /* @__PURE__ */ new Set([
+	"UND_ERR_SOCKET",
+	"UND_ERR_CLOSED",
+	"ECONNRESET",
+	"EPIPE"
+]);
+function causeCode(error) {
+	const cause = error?.cause;
+	return typeof cause?.code === "string" ? cause.code : void 0;
+}
+function isStaleConnection(error) {
+	const code = causeCode(error);
+	return code !== void 0 && STALE.has(code);
+}
+async function retryStale(request) {
+	try {
+		return await request();
+	} catch (error) {
+		if (!isStaleConnection(error)) throw error;
+		return request();
+	}
+}
+/** An error as one line, with fetch's hidden cause: "fetch failed (ECONNREFUSED)". */
+function describeError(error) {
+	const message = error instanceof Error ? error.message : String(error);
+	const code = causeCode(error);
+	return code && !message.includes(code) ? `${message} (${code})` : message;
+}
+//#endregion
 //#region packages/aperture-bot/src/model.ts
 /**
 * The model, as the agent loop calls it on a runner: the providers' plain
@@ -158159,7 +158197,7 @@ var Budget = class {
 function runnerHost(model, budget, runScript) {
 	const call = async (cfg, messages, useTools, signal, tools) => {
 		if (budget.total >= budget.maxTokens) throw new BudgetSpent(`Stopped at the token budget: ${budget.total.toLocaleString("en-US")} of ${budget.maxTokens.toLocaleString("en-US")} tokens used.`);
-		const completion = await model(cfg, messages, useTools, signal, tools);
+		const completion = await retryStale(() => model(cfg, messages, useTools, signal, tools));
 		budget.add(completion);
 		return completion;
 	};
@@ -158567,6 +158605,12 @@ Object.defineProperty(exports, "chooseSandbox", {
 		return chooseSandbox;
 	}
 });
+Object.defineProperty(exports, "describeError", {
+	enumerable: true,
+	get: function() {
+		return describeError;
+	}
+});
 Object.defineProperty(exports, "dockerSandbox", {
 	enumerable: true,
 	get: function() {
@@ -158577,6 +158621,12 @@ Object.defineProperty(exports, "git", {
 	enumerable: true,
 	get: function() {
 		return git;
+	}
+});
+Object.defineProperty(exports, "retryStale", {
+	enumerable: true,
+	get: function() {
+		return retryStale;
 	}
 });
 Object.defineProperty(exports, "runTask", {

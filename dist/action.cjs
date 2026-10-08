@@ -1,4 +1,4 @@
-const require_run = require("./run-BBw4AxgS.cjs");
+const require_run = require("./run-BFrtGU0F.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_child_process = require("node:child_process");
@@ -59,6 +59,11 @@ function parseEvent(name, payload, trigger = DEFAULT_TRIGGER) {
 }
 //#endregion
 //#region packages/aperture-bot/src/github.ts
+/**
+* The few GitHub REST calls the bot makes, over plain fetch with the
+* workflow's token. `fetch` is injectable so the tests run against an API
+* that lives in memory.
+*/
 var GitHubError = class extends Error {
 	status;
 	constructor(message, status) {
@@ -78,7 +83,7 @@ var GitHub = class {
 		this.fetcher = fetcher;
 	}
 	async call(method, path, body, accept = "application/vnd.github+json") {
-		const res = await this.fetcher(`${this.api}${path}`, {
+		const res = await require_run.retryStale(() => this.fetcher(`${this.api}${path}`, {
 			method,
 			headers: {
 				Accept: accept,
@@ -88,7 +93,7 @@ var GitHub = class {
 				...body === void 0 ? {} : { "Content-Type": "application/json" }
 			},
 			body: body === void 0 ? void 0 : JSON.stringify(body)
-		});
+		}));
 		if (!res.ok) {
 			const text = await res.text().catch(() => "");
 			throw new GitHubError(`GitHub answered ${res.status} to ${method} ${path}${text ? `: ${text.slice(0, 200)}` : ""}`, res.status);
@@ -405,15 +410,35 @@ function install(cwd, mode, log) {
 	});
 	if (run.status !== 0) throw new Error(`npm ci failed: ${(run.stderr ?? "").trim().split("\n").at(-1)}`);
 }
-/** Docker with its image pulled first, so the pull never eats into a test's time. */
-function prepareDocker(image, log) {
+/**
+* Docker with its image pulled first, so the pull never eats into a test's
+* time. Asynchronous, so the event loop keeps up with open connections while
+* it waits.
+*/
+async function prepareDocker(image, log) {
 	log(`Pulling the sandbox image ${image}`);
-	const pull = (0, node_child_process.spawnSync)("docker", [
-		"pull",
-		"--quiet",
-		image
-	], { encoding: "utf8" });
-	if (pull.status !== 0) throw new Error(`the sandbox image ${image} could not be pulled: ${(pull.stderr ?? "").trim().split("\n").at(-1)}`);
+	const { code, stderr } = await new Promise((done) => {
+		const child = (0, node_child_process.spawn)("docker", [
+			"pull",
+			"--quiet",
+			image
+		], { stdio: [
+			"ignore",
+			"ignore",
+			"pipe"
+		] });
+		let err = "";
+		child.stderr.on("data", (chunk) => err += chunk.toString());
+		child.on("error", (error) => done({
+			code: -1,
+			stderr: error.message
+		}));
+		child.on("close", (status) => done({
+			code: status,
+			stderr: err
+		}));
+	});
+	if (code !== 0) throw new Error(`the sandbox image ${image} could not be pulled: ${stderr.trim().split("\n").at(-1)}`);
 	return require_run.dockerSandbox(image);
 }
 async function runAction(env, deps = {}) {
@@ -460,7 +485,7 @@ async function runAction(env, deps = {}) {
 			diff = await gh.diff(command.number);
 		}
 		install(cwd, input(env, "install") ?? "auto", log);
-		const sandbox = deps.sandbox !== void 0 ? deps.sandbox : prepareDocker(input(env, "sandbox-image") ?? "mirror.gcr.io/library/node:22-slim", log);
+		const sandbox = deps.sandbox !== void 0 ? deps.sandbox : await prepareDocker(input(env, "sandbox-image") ?? "mirror.gcr.io/library/node:22-slim", log);
 		const comments = await gh.comments(command.number);
 		log(`Aperture Bot: working on #${command.number} for @${command.author}: ${command.task}`);
 		const result = await require_run.runTask({
@@ -515,7 +540,7 @@ async function runAction(env, deps = {}) {
 		setOutput(env, { outcome: result.outcome });
 		return result.outcome === "no-change" ? 0 : 1;
 	} catch (error) {
-		let message = error instanceof Error ? error.message : String(error);
+		let message = require_run.describeError(error);
 		if (error instanceof GitHubError && error.status === 403 && /POST \S+\/pulls/.test(message)) message += " Turn on \"Allow GitHub Actions to create and approve pull requests\" in the repository's Settings, under Actions, General, or pass a token that can.";
 		log(`Aperture Bot: ${message}`);
 		await gh.comment(command.number, errorReply(message, runUrl)).catch(() => void 0);
