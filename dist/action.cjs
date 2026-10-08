@@ -1,4 +1,4 @@
-const require_run = require("./run-CE-7LkaD.cjs");
+const require_run = require("./run-BfUlwXI9.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_child_process = require("node:child_process");
@@ -9,16 +9,16 @@ const CONTEXT_LIMITS = {
 	total: 12e3,
 	diff: 2e4
 };
-const clip = (text, max) => text.length <= max ? text : `${text.slice(0, max)}\n… (cut at ${max} characters)`;
+const clip$1 = (text, max) => text.length <= max ? text : `${text.slice(0, max)}\n… (cut at ${max} characters)`;
 function threadContext(command, comments, diff) {
-	const parts = [`${command.isPull ? "Pull request" : "Issue"} #${command.number}: ${command.title}`, clip(command.body.trim(), 4e3)];
+	const parts = [`${command.isPull ? "Pull request" : "Issue"} #${command.number}: ${command.title}`, clip$1(command.body.trim(), 4e3)];
 	const shown = comments.filter((c) => c.authorType !== "Bot" && c.id !== command.commentId).slice(-CONTEXT_LIMITS.comments);
 	if (shown.length > 0) {
 		parts.push("Comments, oldest first:");
-		for (const c of shown) parts.push(`@${c.author}: ${clip(c.body.trim(), CONTEXT_LIMITS.commentChars)}`);
+		for (const c of shown) parts.push(`@${c.author}: ${clip$1(c.body.trim(), CONTEXT_LIMITS.commentChars)}`);
 	}
-	let text = clip(parts.filter(Boolean).join("\n\n"), CONTEXT_LIMITS.total);
-	if (diff) text += `\n\nThe pull request's diff:\n${clip(diff, CONTEXT_LIMITS.diff)}`;
+	let text = clip$1(parts.filter(Boolean).join("\n\n"), CONTEXT_LIMITS.total);
+	if (diff) text += `\n\nThe pull request's diff:\n${clip$1(diff, CONTEXT_LIMITS.diff)}`;
 	return text;
 }
 //#endregion
@@ -147,7 +147,14 @@ var GitHub = class {
 		};
 	}
 	async comment(issue, body) {
-		return (await this.call("POST", `${this.base}/issues/${issue}/comments`, { body })).html_url;
+		const out = await this.call("POST", `${this.base}/issues/${issue}/comments`, { body });
+		return {
+			id: out.id,
+			url: out.html_url
+		};
+	}
+	async editComment(id, body) {
+		await this.call("PATCH", `${this.base}/issues/comments/${id}`, { body });
 	}
 };
 /** Write access, the bar for asking the bot to change the repository. */
@@ -246,6 +253,53 @@ function diffOf(cwd, paths, max = 3e4) {
 	return diff.length <= max ? diff : `${diff.slice(0, max)}\n… (cut at ${max} characters)`;
 }
 //#endregion
+//#region src/lib/bot/summary.ts
+const OPEN = "<!-- aperture-bot ";
+const CLOSE = " -->";
+const LIMITS = {
+	plan: 7,
+	checks: 30,
+	files: 100,
+	text: 300,
+	error: 1e3
+};
+const clip = (text, max) => text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+/** The summary kept to a size a comment can always carry. */
+function bounded(summary) {
+	return {
+		...summary,
+		plan: summary.plan?.slice(0, LIMITS.plan).map((step) => clip(step, LIMITS.text)),
+		checks: summary.checks?.slice(0, LIMITS.checks).map((row) => ({
+			status: row.status,
+			label: clip(row.label, LIMITS.text),
+			detail: clip(row.detail, LIMITS.text)
+		})),
+		files: summary.files?.slice(0, LIMITS.files),
+		error: summary.error === void 0 ? void 0 : clip(summary.error, LIMITS.error)
+	};
+}
+/**
+* The hidden line. `<` and `>` are written as JSON escapes, so nothing in the
+* text can end the HTML comment early.
+*/
+function summaryMarker(summary) {
+	const json = JSON.stringify(bounded(summary)).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+	return `${OPEN}${json}${CLOSE}`;
+}
+/** What the bot is doing, in a few words. */
+const PHASE_TEXT = {
+	starting: "Reading the thread and setting up",
+	planning: "Planning the change",
+	building: "Making the change",
+	checking: "Running Aperture Agent Check",
+	fixing: "Fixing what Agent Check found",
+	publishing: "Agent Check is clear: publishing"
+};
+/** The phase as a line, with the round when there is one. */
+function phaseLine(summary) {
+	return `${PHASE_TEXT[summary.phase ?? "starting"]}${(summary.phase === "checking" || summary.phase === "fixing") && summary.round ? ` (round ${summary.round}${summary.rounds ? ` of ${summary.rounds}` : ""})` : ""}.`;
+}
+//#endregion
 //#region packages/aperture-bot/src/replies.ts
 /**
 * What the bot says on GitHub: the body of the pull request it opens, and its
@@ -291,6 +345,26 @@ function agentSaid(result) {
 function footer(result, runUrl, where) {
 	return `${where ? `Tests ran ${where}.` : "Tests were not run."} Used ${result.usage}. [The run](${runUrl}) · [Aperture Bot](${SITE})`;
 }
+/** The hidden summary of a finished run, for the Bot page. */
+function resultSummary(result, ctx, link) {
+	return {
+		v: 1,
+		state: result.outcome,
+		asked: ctx.asked,
+		run: ctx.run,
+		plan: result.plan.map((s) => s.content),
+		checks: result.check ? require_run.shownRows(result.check.rows).map((r) => ({
+			status: r.status,
+			label: r.label,
+			detail: r.detail
+		})) : [],
+		files: result.written,
+		link,
+		tests: ctx.tests,
+		usage: result.usage,
+		error: result.error
+	};
+}
 const join$1 = (...blocks) => blocks.filter((b) => b.length > 0).map((b) => b.join("\n")).join("\n\n");
 function commitMessage(command, result) {
 	return join$1([titleFor(command)], [`Asked by @${command.author} in #${command.number}. Checked by Aperture Agent Check.`], result.plan.length > 0 ? result.plan.map((s) => `- ${s.content}`) : []);
@@ -306,10 +380,21 @@ function pullBody(command, result, runUrl, where) {
 		...checksTable(result)
 	], agentSaid(result), [footer(result, runUrl, where)]);
 }
+/** While the bot works: the comment it edits as it goes, and at the end into its reply. */
+function workingReply(progress, ctx) {
+	return join$1([`**Aperture Bot is on it.** ${phaseLine(progress)}`], progress.plan?.length ? ["**Plan**", ...progress.plan.map((s) => `- ${s}`)] : [], [`[Follow the run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
+		v: 1,
+		state: "working",
+		asked: ctx.asked,
+		run: ctx.run,
+		...progress
+	})]);
+}
 /** On the thread, after a pull request is opened or a commit pushed. */
-function doneReply(result, link) {
+function doneReply(result, link, ctx) {
 	const files = result.written.map((p) => `\`${p}\``).join(", ");
-	return link.what === "pull" ? `Opened ${link.url}, changing ${files}. Aperture Agent Check found nothing red.` : `Pushed ${link.url} to this pull request, changing ${files}. Aperture Agent Check found nothing red.`;
+	const text = link.what === "pull" ? `Opened ${link.url}, changing ${files}. Aperture Agent Check found nothing red.` : `Pushed ${link.url} to this pull request, changing ${files}. Aperture Agent Check found nothing red.`;
+	return join$1([text], plan(result), [footer(result, ctx.run, ctx.tests)], [summaryMarker(resultSummary(result, ctx, link))]);
 }
 const OUTCOME = {
 	red: "I made a change, but Aperture Agent Check is still red after my fixes, so I did not push it.",
@@ -317,7 +402,7 @@ const OUTCOME = {
 	"no-change": "I did not change any file."
 };
 /** On the thread, when nothing was published. */
-function notDoneReply(result, diff, runUrl, where) {
+function notDoneReply(result, diff, ctx) {
 	const outcome = result.outcome === "clear" ? "no-change" : result.outcome;
 	return join$1([OUTCOME[outcome]], result.error ? [`> ${result.error}`] : [], checksTable(result), result.refused.map((r) => `Refused to write \`${r.path}\`: ${r.reason}.`), diff ? [
 		"<details><summary>The change I did not push</summary>",
@@ -327,15 +412,32 @@ function notDoneReply(result, diff, runUrl, where) {
 		"```",
 		"",
 		"</details>"
-	] : [], agentSaid(result), [footer(result, runUrl, where)]);
+	] : [], agentSaid(result), [footer(result, ctx.run, ctx.tests)], [summaryMarker(resultSummary(result, ctx))]);
 }
-const FORK_REPLY = [
-	"This pull request comes from a fork, so Aperture Bot will not check out its code, run it, or push to it.",
-	"",
-	"Ask on an issue instead, or push the branch to this repository and ask on that pull request."
-].join("\n");
-function errorReply(message, runUrl) {
-	return `Aperture Bot stopped with an error and changed nothing:\n\n> ${message}\n\n[The run](${runUrl})`;
+function forkReply(ctx) {
+	return join$1([
+		"This pull request comes from a fork, so Aperture Bot will not check out its code, run it, or push to it.",
+		"",
+		"Ask on an issue instead, or push the branch to this repository and ask on that pull request."
+	], [summaryMarker({
+		v: 1,
+		state: "declined",
+		asked: ctx.asked,
+		run: ctx.run
+	})]);
+}
+function errorReply(message, ctx) {
+	return join$1([
+		"Aperture Bot stopped with an error and changed nothing:",
+		"",
+		`> ${message}`
+	], [`[The run](${ctx.run})`], [summaryMarker({
+		v: 1,
+		state: "error",
+		asked: ctx.asked,
+		run: ctx.run,
+		error: message
+	})]);
 }
 //#endregion
 //#region packages/aperture-bot/src/action.ts
@@ -470,6 +572,23 @@ async function runAction(env, deps = {}) {
 	const repoUrl = `${env.GITHUB_SERVER_URL ?? "https://github.com"}/${command.owner}/${command.repo}`;
 	const runUrl = env.GITHUB_RUN_ID ? `${repoUrl}/actions/runs/${env.GITHUB_RUN_ID}` : repoUrl;
 	const cwd = (0, node_path.resolve)(input(env, "working-directory") ?? env.GITHUB_WORKSPACE ?? process.cwd());
+	const asked = {
+		asked: command.commentId,
+		run: runUrl
+	};
+	let status = null;
+	let edits = Promise.resolve();
+	const reply = async (body) => {
+		await edits;
+		if (status === null) await gh.comment(command.number, body);
+		else await gh.editComment(status, body);
+	};
+	const report = (progress) => {
+		if (status === null) return Promise.resolve();
+		const id = status;
+		edits = edits.then(() => gh.editComment(id, workingReply(progress, asked))).catch(() => void 0);
+		return edits;
+	};
 	try {
 		const model = modelConfig(env);
 		let pull = null;
@@ -477,10 +596,13 @@ async function runAction(env, deps = {}) {
 		if (command.isPull) {
 			pull = await gh.pull(command.number);
 			if (pull.headRepo.toLowerCase() !== `${command.owner}/${command.repo}`.toLowerCase()) {
-				await gh.comment(command.number, FORK_REPLY);
+				await gh.comment(command.number, forkReply(asked));
 				setOutput(env, { outcome: "declined" });
 				return 0;
 			}
+		}
+		status = await gh.comment(command.number, workingReply({ phase: "starting" }, asked)).then((posted) => Number.isSafeInteger(posted.id) ? posted.id : null).catch(() => null);
+		if (pull) {
 			checkoutPullHead(cwd, pull.headRef);
 			diff = await gh.diff(command.number);
 		}
@@ -498,19 +620,28 @@ async function runAction(env, deps = {}) {
 			timeoutMs: number(env, "timeout-minutes", 10) * 6e4,
 			maxTokens: number(env, "max-tokens", 1e6),
 			rounds: Math.floor(number(env, "rounds", 2))
-		}, { model: deps.model });
+		}, {
+			model: deps.model,
+			onProgress: report
+		});
 		log(result.text);
 		if (env.GITHUB_STEP_SUMMARY) (0, node_fs.appendFileSync)(env.GITHUB_STEP_SUMMARY, `### Aperture Bot\n\n\`\`\`\n${result.text}\n\`\`\`\n`);
-		const where = sandbox?.where ?? null;
+		const ctx = {
+			...asked,
+			tests: sandbox?.where ?? null
+		};
 		if (result.outcome === "clear") {
+			await report({
+				phase: "publishing",
+				plan: result.plan.map((s) => s.content)
+			});
 			const sha = commitFiles(cwd, result.written, commitMessage(command, result));
 			if (pull) {
 				push(cwd, pull.headRef);
-				const url = `${repoUrl}/commit/${sha}`;
-				await gh.comment(command.number, doneReply(result, {
-					url,
+				await reply(doneReply(result, {
+					url: `${repoUrl}/commit/${sha}`,
 					what: "commit"
-				}));
+				}, ctx));
 				setOutput(env, {
 					outcome: "clear",
 					commit: sha
@@ -522,12 +653,12 @@ async function runAction(env, deps = {}) {
 					title: titleFor(command),
 					head: branch,
 					base: command.defaultBranch,
-					body: pullBody(command, result, runUrl, where)
+					body: pullBody(command, result, runUrl, ctx.tests)
 				});
-				await gh.comment(command.number, doneReply(result, {
+				await reply(doneReply(result, {
 					url: opened.url,
 					what: "pull"
-				}));
+				}, ctx));
 				setOutput(env, {
 					outcome: "clear",
 					"pull-request": opened.url,
@@ -536,14 +667,14 @@ async function runAction(env, deps = {}) {
 			}
 			return 0;
 		}
-		await gh.comment(command.number, notDoneReply(result, diffOf(cwd, result.written), runUrl, where));
+		await reply(notDoneReply(result, diffOf(cwd, result.written), ctx));
 		setOutput(env, { outcome: result.outcome });
 		return result.outcome === "no-change" ? 0 : 1;
 	} catch (error) {
 		let message = require_run.describeError(error);
 		if (error instanceof GitHubError && error.status === 403 && /POST \S+\/pulls/.test(message)) message += " Turn on \"Allow GitHub Actions to create and approve pull requests\" in the repository's Settings, under Actions, General, or pass a token that can.";
 		log(`Aperture Bot: ${message}`);
-		await gh.comment(command.number, errorReply(message, runUrl)).catch(() => void 0);
+		await reply(errorReply(message, asked)).catch(() => void 0);
 		setOutput(env, { outcome: "error" });
 		return 1;
 	}

@@ -158023,7 +158023,7 @@ async function postChat(cfg, body, signal) {
 		}),
 		signal
 	};
-	const pinned = cfg.provider === "custom" ? await (await Promise.resolve().then(() => require("./custom-endpoint.server-DMtiCpyy.cjs"))).customEndpointFetch(base, "/chat/completions", init) : null;
+	const pinned = cfg.provider === "custom" ? await (await Promise.resolve().then(() => require("./custom-endpoint.server-D2EfOOnP.cjs"))).customEndpointFetch(base, "/chat/completions", init) : null;
 	const res = pinned?.response ?? await fetch(`${base}/chat/completions`, {
 		...init,
 		redirect: "manual"
@@ -158501,6 +158501,13 @@ function changedFrom(texts, before) {
 }
 async function runTask(options, deps = {}) {
 	const { cwd } = options;
+	const progress = async (p) => {
+		await deps.onProgress?.({
+			...p,
+			plan: result.plan.map((s) => s.content),
+			rounds: options.rounds
+		});
+	};
 	const start = git(["rev-parse", "HEAD"], cwd).trim();
 	const budget = new Budget(options.maxTokens);
 	const sandbox = options.sandbox;
@@ -158557,6 +158564,7 @@ async function runTask(options, deps = {}) {
 		};
 	};
 	const stopped = (error) => finish("stopped", error);
+	await progress({ phase: "planning" });
 	const planned = await turn({ phase: "plan" });
 	if (!planned.out.ok) return stopped(planned.out.error);
 	result.summary = planned.out.text;
@@ -158570,6 +158578,7 @@ async function runTask(options, deps = {}) {
 		content: planned.out.text
 	}];
 	let ask = instruction;
+	await progress({ phase: "building" });
 	for (let round = 1;; round += 1) {
 		const built = await turn({
 			phase: "build",
@@ -158583,6 +158592,10 @@ async function runTask(options, deps = {}) {
 		result.written = [.../* @__PURE__ */ new Set([...result.written, ...written.written])];
 		result.refused.push(...written.refused);
 		if (result.written.length === 0) return finish("no-change");
+		await progress({
+			phase: "checking",
+			round
+		});
 		result.check = check({
 			cwd,
 			base: start,
@@ -158596,6 +158609,10 @@ async function runTask(options, deps = {}) {
 		result.checks += 1;
 		if (result.check.verdict === "clear") return finish("clear");
 		if (round >= options.rounds) return finish("red");
+		await progress({
+			phase: "fixing",
+			round: round + 1
+		});
 		history.push({
 			role: "user",
 			content: ask
