@@ -24,6 +24,7 @@ function threadContext(command, comments, diff) {
 //#endregion
 //#region packages/aperture-bot/src/event.ts
 const DEFAULT_TRIGGER = "/aperture";
+const DEFAULT_LABEL = "aperture";
 /** The task after the trigger, or null when the comment does not start with it. */
 function taskFrom(body, trigger = DEFAULT_TRIGGER) {
 	const text = body.trimStart();
@@ -32,8 +33,10 @@ function taskFrom(body, trigger = DEFAULT_TRIGGER) {
 	if (rest !== "" && !/^\s/.test(rest)) return null;
 	return rest.trim();
 }
-function parseEvent(name, payload, trigger = DEFAULT_TRIGGER) {
-	if (name !== "issue_comment") return { ignored: `${name} events are not commands; the bot answers issue comments.` };
+function parseEvent(name, payload, trigger = DEFAULT_TRIGGER, label = DEFAULT_LABEL) {
+	if (name === "schedule" || name === "workflow_dispatch") return { scheduled: true };
+	if (name === "issues") return labelled(payload, label);
+	if (name !== "issue_comment") return { ignored: `${name} events are not commands; the bot answers comments, its label and its schedule.` };
 	const event = payload ?? {};
 	if (event.action !== "created") return { ignored: "only new comments are commands, not edits." };
 	const user = event.comment?.user;
@@ -52,6 +55,33 @@ function parseEvent(name, payload, trigger = DEFAULT_TRIGGER) {
 		task: task || `Do what this ${issue.pull_request ? "pull request" : "issue"} asks: ${title}`,
 		commentId: event.comment.id,
 		author: user.login,
+		via: "comment",
+		owner: repo.owner.login,
+		repo: repo.name,
+		defaultBranch: repo.default_branch ?? "main"
+	} };
+}
+/** An issue given the bot's label: do what it asks, for whoever added the label. */
+function labelled(payload, label) {
+	const event = payload ?? {};
+	if (event.action !== "labeled") return { ignored: "only an added label is a command." };
+	const added = event.label?.name ?? "";
+	if (added.toLowerCase() !== label.toLowerCase()) return { ignored: `the label ${added || "(none)"} is not ${label}.` };
+	if (event.sender?.type === "Bot") return { ignored: "labels added by bots are not commands." };
+	const issue = event.issue;
+	const repo = event.repository;
+	if (!issue?.number || !event.sender?.login || !repo?.name || !repo.owner?.login) return { ignored: "the event is missing the issue, sender or repository." };
+	if (issue.pull_request) return { ignored: "the label only asks on issues." };
+	const title = issue.title ?? "";
+	return { command: {
+		number: issue.number,
+		isPull: false,
+		title,
+		body: issue.body ?? "",
+		task: `Do what this issue asks: ${title}`,
+		commentId: null,
+		author: event.sender.login,
+		via: "label",
 		owner: repo.owner.login,
 		repo: repo.name,
 		defaultBranch: repo.default_branch ?? "main"
@@ -152,6 +182,53 @@ var GitHub = class {
 			id: out.id,
 			url: out.html_url
 		};
+	}
+	async defaultBranch() {
+		return (await this.call("GET", this.base)).default_branch ?? "main";
+	}
+	/** The commit a branch points at. */
+	async head(branch) {
+		return (await this.call("GET", `${this.base}/branches/${encodeURIComponent(branch)}`)).commit?.sha ?? "";
+	}
+	/** The checks and statuses on a commit that finished red, with what they said. */
+	async failures(sha) {
+		const [runs, status] = await Promise.all([this.call("GET", `${this.base}/commits/${sha}/check-runs?per_page=100`), this.call("GET", `${this.base}/commits/${sha}/status`)]);
+		const out = [];
+		for (const run of runs.check_runs ?? []) {
+			if (run.status !== "completed" || !["failure", "timed_out"].includes(run.conclusion ?? "")) continue;
+			const notes = await this.call("GET", `${this.base}/check-runs/${run.id}/annotations?per_page=20`).catch(() => []);
+			out.push({
+				name: run.name,
+				detail: [run.output?.title, run.output?.summary].filter(Boolean).join("\n"),
+				annotations: notes.map((n) => `${n.path}:${n.start_line ?? 1}: ${n.message ?? ""}`)
+			});
+		}
+		for (const s of status.statuses ?? []) if (s.state === "failure" || s.state === "error") out.push({
+			name: s.context,
+			detail: s.description ?? "",
+			annotations: []
+		});
+		return out;
+	}
+	async openIssues() {
+		return (await this.call("GET", `${this.base}/issues?state=open&per_page=100`)).map((i) => ({
+			number: i.number,
+			title: i.title,
+			isPull: Boolean(i.pull_request)
+		}));
+	}
+	async createIssue(title, body) {
+		return (await this.call("POST", `${this.base}/issues`, {
+			title,
+			body
+		})).number;
+	}
+	/** Open pull requests from this repository's branches: their branch and page. */
+	async openPulls() {
+		return (await this.call("GET", `${this.base}/pulls?state=open&per_page=100`)).map((p) => ({
+			headRef: p.head.ref,
+			url: p.html_url
+		}));
 	}
 	async editComment(id, body) {
 		await this.call("PATCH", `${this.base}/issues/comments/${id}`, { body });
@@ -275,6 +352,7 @@ function bounded(summary) {
 			detail: clip(row.detail, LIMITS.text)
 		})),
 		files: summary.files?.slice(0, LIMITS.files),
+		task: summary.task === void 0 ? void 0 : clip(summary.task, LIMITS.error),
 		error: summary.error === void 0 ? void 0 : clip(summary.error, LIMITS.error)
 	};
 }
@@ -314,8 +392,24 @@ const MARK = {
 const cell = (text) => text.replace(/\|/g, "\\|").replace(/\n/g, " ");
 const firstLine = (text) => text.split("\n")[0].trim();
 const SITE = "https://aperturesais.grok.me";
+/** How the asking reads in a commit or a pull request: who asked, and how. */
+function askedBy(command) {
+	if (command.via === "label") return `@${command.author} labelled #${command.number} for the bot`;
+	if (command.via === "schedule") return `A standing job, on #${command.number}`;
+	return `@${command.author} asked in #${command.number}`;
+}
+/** The fields of a summary that say who asked, when no comment did. */
+const askedFields = (ctx) => ctx.via ? {
+	via: ctx.via,
+	by: ctx.by,
+	task: ctx.task
+} : {};
 /** A title for the commit and the pull request: the task's first line, or the issue's title. */
 function titleFor(command) {
+	if (command.via === "schedule") {
+		const job = command.title.replace(/^Aperture Bot: /, "");
+		return `${job.charAt(0).toUpperCase()}${job.slice(1)}`.slice(0, 72);
+	}
 	const asked = firstLine(command.task);
 	const title = asked.startsWith("Do what this ") ? command.title : asked;
 	return title.length <= 72 ? title : `${title.slice(0, 71)}…`;
@@ -352,6 +446,7 @@ function resultSummary(result, ctx, link) {
 		state: result.outcome,
 		asked: ctx.asked,
 		run: ctx.run,
+		...askedFields(ctx),
 		plan: result.plan.map((s) => s.content),
 		checks: result.check ? require_run.shownRows(result.check.rows).map((r) => ({
 			status: r.status,
@@ -367,11 +462,11 @@ function resultSummary(result, ctx, link) {
 }
 const join$1 = (...blocks) => blocks.filter((b) => b.length > 0).map((b) => b.join("\n")).join("\n\n");
 function commitMessage(command, result) {
-	return join$1([titleFor(command)], [`Asked by @${command.author} in #${command.number}. Checked by Aperture Agent Check.`], result.plan.length > 0 ? result.plan.map((s) => `- ${s.content}`) : []);
+	return join$1([titleFor(command)], [`${askedBy(command)}. Checked by Aperture Agent Check.`], result.plan.length > 0 ? result.plan.map((s) => `- ${s.content}`) : []);
 }
 function pullBody(command, result, runUrl, where) {
 	return join$1([
-		`@${command.author} asked in #${command.number}:`,
+		`${askedBy(command)}:`,
 		"",
 		`> ${firstLine(command.task)}`
 	], command.isPull ? [] : [`Fixes #${command.number}`], plan(result), [
@@ -387,6 +482,7 @@ function workingReply(progress, ctx) {
 		state: "working",
 		asked: ctx.asked,
 		run: ctx.run,
+		...askedFields(ctx),
 		...progress
 	})]);
 }
@@ -436,17 +532,85 @@ function errorReply(message, ctx) {
 		state: "error",
 		asked: ctx.asked,
 		run: ctx.run,
+		...askedFields(ctx),
 		error: message
 	})]);
 }
 //#endregion
+//#region packages/aperture-bot/src/jobs.ts
+function jobFrom(scheduled) {
+	const text = scheduled?.trim() ?? "";
+	if (!text) return null;
+	return text.toLowerCase() === "fix-ci" ? { kind: "fix-ci" } : {
+		kind: "task",
+		task: text
+	};
+}
+function jobTitle(job, branch) {
+	if (job.kind === "fix-ci") return `Aperture Bot: fix what is red on ${branch}`;
+	const first = job.task.split("\n")[0].trim();
+	return `Aperture Bot: ${first.length <= 60 ? first : `${first.slice(0, 59)}…`}`;
+}
+const MAX_FAILURES = 8;
+const MAX_ANNOTATIONS = 10;
+const DETAIL_CHARS = 1500;
+/** The task for a red branch: which checks fail, and what they said. */
+function fixCiTask(branch, sha, failures) {
+	const lines = [
+		`These checks fail on ${branch} at ${sha.slice(0, 7)}. Find why in the code, and fix it so they pass.`,
+		"Never skip, delete or weaken a test to get there: if a test is wrong, say why in your answer and leave it.",
+		""
+	];
+	for (const f of failures.slice(0, MAX_FAILURES)) {
+		lines.push(`- ${f.name}`);
+		if (f.detail.trim()) lines.push(`  ${f.detail.trim().slice(0, DETAIL_CHARS).replace(/\n/g, "\n  ")}`);
+		for (const a of f.annotations.slice(0, MAX_ANNOTATIONS)) lines.push(`  ${a}`);
+	}
+	if (failures.length > MAX_FAILURES) lines.push(`- and ${failures.length - MAX_FAILURES} more`);
+	return lines.join("\n");
+}
+/** The command a job comes to on this run, or why it does nothing. */
+async function planJob(gh, job, repo) {
+	const branch = await gh.defaultBranch();
+	let task = job.kind === "task" ? job.task : "";
+	let body = job.kind === "task" ? `A standing job for Aperture Bot, run on the workflow's schedule:\n\n> ${job.task.replace(/\n/g, "\n> ")}` : "";
+	if (job.kind === "fix-ci") {
+		const sha = await gh.head(branch);
+		const failures = sha ? await gh.failures(sha) : [];
+		if (failures.length === 0) return { skip: `${branch} is green: nothing to fix.` };
+		task = fixCiTask(branch, sha, failures);
+		body = `Aperture Bot's nightly job found checks failing on ${branch}.\n\n${task}`;
+	}
+	const title = jobTitle(job, branch);
+	const existing = (await gh.openIssues()).find((i) => !i.isPull && i.title === title);
+	if (existing) {
+		const waiting = (await gh.openPulls()).find((p) => p.headRef.startsWith(`aperture/${existing.number}-`));
+		if (waiting) return { skip: `a pull request for #${existing.number} is waiting for review: ${waiting.url}` };
+	}
+	return { command: {
+		number: existing?.number ?? await gh.createIssue(title, body),
+		isPull: false,
+		title,
+		body,
+		task,
+		commentId: null,
+		author: "schedule",
+		via: "schedule",
+		owner: repo.owner,
+		repo: repo.repo,
+		defaultBranch: branch
+	} };
+}
+//#endregion
 //#region packages/aperture-bot/src/action.ts
 /**
-* Aperture Bot as a GitHub Action, on `issue_comment`. A comment that starts
-* with `/aperture` from someone with write access becomes a task; the bot runs
-* it on the checkout and, only when Aperture Agent Check is clear, opens a pull
-* request (asked on an issue) or pushes to the pull request (asked on one).
-* Otherwise it replies with what it tried and why it stopped.
+* Aperture Bot as a GitHub Action. A comment that starts with `/aperture`, or
+* the `aperture` label on an issue, from someone with write access becomes a
+* task; so does the workflow's schedule, with its `scheduled` job (jobs.ts).
+* The bot runs it on the checkout and, only when Aperture Agent Check is
+* clear, opens a pull request (asked on an issue) or pushes to the pull
+* request (asked on one). Otherwise it replies with what it tried and why it
+* stopped.
 *
 * Settings arrive as INPUT_* variables, as GitHub passes an action's inputs.
 */
@@ -549,32 +713,52 @@ async function runAction(env, deps = {}) {
 	try {
 		payload = JSON.parse((0, node_fs.readFileSync)(env.GITHUB_EVENT_PATH ?? "", "utf8"));
 	} catch {}
-	const parsed = parseEvent(env.GITHUB_EVENT_NAME ?? "", payload, input(env, "trigger") ?? "/aperture");
-	if ("ignored" in parsed) {
-		log(`Aperture Bot: nothing to do: ${parsed.ignored}`);
+	const parsed = parseEvent(env.GITHUB_EVENT_NAME ?? "", payload, input(env, "trigger") ?? "/aperture", input(env, "label") ?? "aperture");
+	const ignore = (why) => {
+		log(`Aperture Bot: nothing to do: ${why}`);
 		setOutput(env, { outcome: "ignored" });
 		return 0;
-	}
-	const command = parsed.command;
+	};
+	if ("ignored" in parsed) return ignore(parsed.ignored);
+	const job = "scheduled" in parsed ? jobFrom(input(env, "scheduled")) : null;
+	if ("scheduled" in parsed && !job) return ignore("the workflow ran on its schedule, but its scheduled input is empty.");
+	const [owner, name] = "command" in parsed ? [parsed.command.owner, parsed.command.repo] : (env.GITHUB_REPOSITORY ?? "").split("/");
+	if (!owner || !name) throw new Error("GITHUB_REPOSITORY is not owner/repo.");
 	const token = input(env, "github-token") ?? env.GITHUB_TOKEN;
 	if (!token) throw new Error("github-token is empty.");
 	const gh = new GitHub({
-		owner: command.owner,
-		repo: command.repo
+		owner,
+		repo: name
 	}, token, env.GITHUB_API_URL ?? "https://api.github.com", deps.fetch);
-	const permission = await gh.permission(command.author);
-	if (!canWrite(permission)) {
-		log(`Aperture Bot: @${command.author} has ${permission} access; only people who can write may ask.`);
-		setOutput(env, { outcome: "ignored" });
-		return 0;
+	let command;
+	if ("command" in parsed) {
+		command = parsed.command;
+		const permission = await gh.permission(command.author);
+		if (!canWrite(permission)) {
+			log(`Aperture Bot: @${command.author} has ${permission} access; only people who can write may ask.`);
+			setOutput(env, { outcome: "ignored" });
+			return 0;
+		}
+		if (command.commentId !== null) await gh.react(command.commentId, "eyes").catch(() => void 0);
+	} else {
+		const planned = await planJob(gh, job, {
+			owner,
+			repo: name
+		});
+		if ("skip" in planned) return ignore(planned.skip);
+		command = planned.command;
 	}
-	await gh.react(command.commentId, "eyes").catch(() => void 0);
 	const repoUrl = `${env.GITHUB_SERVER_URL ?? "https://github.com"}/${command.owner}/${command.repo}`;
 	const runUrl = env.GITHUB_RUN_ID ? `${repoUrl}/actions/runs/${env.GITHUB_RUN_ID}` : repoUrl;
 	const cwd = (0, node_path.resolve)(input(env, "working-directory") ?? env.GITHUB_WORKSPACE ?? process.cwd());
 	const asked = {
-		asked: command.commentId,
-		run: runUrl
+		asked: command.commentId ?? 0,
+		run: runUrl,
+		...command.via === "comment" ? {} : {
+			via: command.via,
+			by: command.author,
+			task: command.task
+		}
 	};
 	let status = null;
 	let edits = Promise.resolve();
