@@ -176,11 +176,17 @@ var GitHub = class {
 			url: out.html_url
 		};
 	}
+	/** Posts a comment; `by` is who the token posts as, which names the bot's commits. */
 	async comment(issue, body) {
 		const out = await this.call("POST", `${this.base}/issues/${issue}/comments`, { body });
+		const by = out.user?.login && typeof out.user.id === "number" ? {
+			login: out.user.login,
+			id: out.user.id
+		} : null;
 		return {
 			id: out.id,
-			url: out.html_url
+			url: out.html_url,
+			by
 		};
 	}
 	async defaultBranch() {
@@ -254,6 +260,18 @@ const BOT_AUTHOR = {
 	name: "Aperture Bot",
 	email: "41898282+github-actions[bot]@users.noreply.github.com"
 };
+/**
+* The commit author for whoever the token posts as: a GitHub App's bot user
+* (`my-app[bot]`), so its commits show the app's name and avatar, or else
+* the workflow's own identity.
+*/
+function authorFor(poster) {
+	if (!poster || !poster.login.endsWith("[bot]") || poster.login === "github-actions[bot]") return BOT_AUTHOR;
+	return {
+		name: "Aperture Bot",
+		email: `${poster.id}+${poster.login}@users.noreply.github.com`
+	};
+}
 function slug(text, max = 40) {
 	return text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, max).replace(/-+$/, "") || "change";
 }
@@ -287,7 +305,7 @@ function checkoutPullHead(cwd, ref) {
 	], cwd);
 }
 /** Commits exactly `paths` (relative to `cwd`) and returns the commit. */
-function commitFiles(cwd, paths, message) {
+function commitFiles(cwd, paths, message, author = BOT_AUTHOR) {
 	require_run.git([
 		"add",
 		"--",
@@ -295,9 +313,9 @@ function commitFiles(cwd, paths, message) {
 	], cwd);
 	require_run.git([
 		"-c",
-		`user.name=${BOT_AUTHOR.name}`,
+		`user.name=${author.name}`,
 		"-c",
-		`user.email=${BOT_AUTHOR.email}`,
+		`user.email=${author.email}`,
 		"commit",
 		"--no-verify",
 		"-m",
@@ -761,6 +779,8 @@ async function runAction(env, deps = {}) {
 		}
 	};
 	let status = null;
+	/** Who the token posts as: a GitHub App's bot, or the workflow's. */
+	let poster = null;
 	let edits = Promise.resolve();
 	const reply = async (body) => {
 		await edits;
@@ -785,7 +805,10 @@ async function runAction(env, deps = {}) {
 				return 0;
 			}
 		}
-		status = await gh.comment(command.number, workingReply({ phase: "starting" }, asked)).then((posted) => Number.isSafeInteger(posted.id) ? posted.id : null).catch(() => null);
+		status = await gh.comment(command.number, workingReply({ phase: "starting" }, asked)).then((posted) => {
+			poster = posted.by;
+			return Number.isSafeInteger(posted.id) ? posted.id : null;
+		}).catch(() => null);
 		if (pull) {
 			checkoutPullHead(cwd, pull.headRef);
 			diff = await gh.diff(command.number);
@@ -819,7 +842,7 @@ async function runAction(env, deps = {}) {
 				phase: "publishing",
 				plan: result.plan.map((s) => s.content)
 			});
-			const sha = commitFiles(cwd, result.written, commitMessage(command, result));
+			const sha = commitFiles(cwd, result.written, commitMessage(command, result), authorFor(poster));
 			if (pull) {
 				push(cwd, pull.headRef);
 				await reply(doneReply(result, {
