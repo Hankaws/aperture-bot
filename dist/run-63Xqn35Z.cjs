@@ -158105,6 +158105,20 @@ async function refused(name, res, apiKey) {
 	const detail = said ? `: ${said.length > 240 ? `${said.slice(0, 239)}…` : said}` : ".";
 	return Object.assign(/* @__PURE__ */ new Error(`${name} refused the request (${res.status})${detail}`), { status: res.status });
 }
+/**
+* A provider's reply, read as JSON. An answer that is not JSON (a parked
+* address saying "OK", an HTML error page) says what it was, not "Unexpected
+* token".
+*/
+async function replyJson(name, res) {
+	const text = await res.text();
+	try {
+		return JSON.parse(text);
+	} catch {
+		const said = text.replace(/\s+/g, " ").trim().slice(0, 120);
+		throw new Error(`${name} answered with something that is not a model's reply${said ? `: "${said}"` : ""}. Check the address and the model name.`);
+	}
+}
 async function postChat(cfg, body, signal) {
 	const { base, model } = endpointOf(cfg);
 	const headers = { "Content-Type": "application/json" };
@@ -158183,7 +158197,8 @@ async function complete(cfg, messages, useTools, signal, tools = AGENT_TOOLS) {
 		body.tools = tools;
 		body.tool_choice = "auto";
 	}
-	const data = await (await postChat(cfg, body, signal)).json();
+	const res = await postChat(cfg, body, signal);
+	const data = await replyJson(cfg.provider === "custom" ? "The endpoint" : cfg.provider, res);
 	const message = data.choices[0]?.message;
 	return {
 		content: message?.content ?? "",
@@ -158209,7 +158224,7 @@ async function completeAnthropic(apiKey, messages, useTools, signal, tools = AGE
 		signal
 	});
 	if (!res.ok) throw await refused("anthropic", res, apiKey);
-	const data = await res.json();
+	const data = await replyJson("anthropic", res);
 	if (data.stop_reason === "refusal") throw anthropicRefusal(data.stop_details);
 	const text = data.content.filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
 	const tool_calls = data.content.filter((b) => b.type === "tool_use").map((b) => ({
@@ -158722,7 +158737,7 @@ async function runTask(options, deps = {}) {
 	await progress({ phase: "planning" });
 	const planned = await turn({ phase: "plan" });
 	if (!planned.out.ok) return stopped(planned.out.error);
-	result.summary = planned.out.text;
+	result.summary = planned.out.text === planReadyText(void 0) ? "" : planned.out.text;
 	result.plan = planned.out.plan ?? [];
 	if (result.plan.length === 0) return finish("no-change");
 	const history = [{
@@ -158730,7 +158745,7 @@ async function runTask(options, deps = {}) {
 		content: instruction
 	}, {
 		role: "assistant",
-		content: planned.out.text
+		content: result.summary || "Here is the plan."
 	}];
 	let ask = instruction;
 	await progress({ phase: "building" });
