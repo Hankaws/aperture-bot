@@ -158103,7 +158103,7 @@ async function refused(name, res, apiKey) {
 		if (apiKey) said = said.split(apiKey).join("[key]");
 	} catch {}
 	const detail = said ? `: ${said.length > 240 ? `${said.slice(0, 239)}…` : said}` : ".";
-	return /* @__PURE__ */ new Error(`${name} refused the request (${res.status})${detail}`);
+	return Object.assign(/* @__PURE__ */ new Error(`${name} refused the request (${res.status})${detail}`), { status: res.status });
 }
 async function postChat(cfg, body, signal) {
 	const { base, model } = endpointOf(cfg);
@@ -158305,6 +158305,44 @@ async function retryStale(request) {
 		return request();
 	}
 }
+/**
+* What a provider says when it is busy rather than when the request is wrong:
+* rate limited, overloaded, or down for a moment. Worth waiting out.
+*/
+const BUSY = /* @__PURE__ */ new Set([
+	429,
+	500,
+	502,
+	503,
+	504,
+	529
+]);
+function isBusy(error) {
+	const status = error?.status;
+	return typeof status === "number" && BUSY.has(status);
+}
+/** How long to wait before each retry of a busy model: about a minute and a half in all. */
+const BUSY_WAITS_MS = [
+	1e4,
+	3e4,
+	6e4
+];
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+/**
+* A model call, tried again while the provider says it is busy, waiting
+* longer each time. Any other error, or the last busy one, is thrown.
+*/
+async function retryBusy(request, options = {}) {
+	const waits = options.waits ?? BUSY_WAITS_MS;
+	for (let attempt = 0;; attempt += 1) try {
+		return await request();
+	} catch (error) {
+		const ms = waits[attempt];
+		if (!isBusy(error) || ms === void 0) throw error;
+		options.log?.(`The model is busy (${describeError(error)}); trying again in ${ms / 1e3} s.`);
+		await (options.wait ?? sleep)(ms);
+	}
+}
 /** An error as one line, with fetch's hidden cause: "fetch failed (ECONNREFUSED)". */
 function describeError(error) {
 	const message = error instanceof Error ? error.message : String(error);
@@ -158352,7 +158390,7 @@ var Budget = class {
 function runnerHost(model, budget, runScript) {
 	const call = async (cfg, messages, useTools, signal, tools) => {
 		if (budget.total >= budget.maxTokens) throw new BudgetSpent(`Stopped at the token budget: ${budget.total.toLocaleString("en-US")} of ${budget.maxTokens.toLocaleString("en-US")} tokens used.`);
-		const completion = await retryStale(() => model(cfg, messages, useTools, signal, tools));
+		const completion = await retryBusy(() => retryStale(() => model(cfg, messages, useTools, signal, tools)), { log: (line) => console.log(line) });
 		budget.add(completion);
 		return completion;
 	};
