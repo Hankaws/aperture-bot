@@ -1,4 +1,4 @@
-const require_run = require("./run-CK4kn0uA.cjs");
+const require_run = require("./run-CsP996Gr.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_child_process = require("node:child_process");
@@ -33,9 +33,12 @@ function taskFrom(body, trigger = DEFAULT_TRIGGER) {
 	if (rest !== "" && !/^\s/.test(rest)) return null;
 	return rest.trim();
 }
-/** `/aperture check`: the whole task is the word, so "check the login flow" stays a task. */
+/**
+* `/aperture check`: the first line is the word alone, so "check the login
+* flow" stays a task, and a signature or footer under it changes nothing.
+*/
 function isCheck(task) {
-	return /^check[.!]?$/i.test(task.trim());
+	return /^check[.!]?$/i.test(task.trim().split("\n")[0].trim());
 }
 function parseEvent(name, payload, trigger = DEFAULT_TRIGGER, label = DEFAULT_LABEL) {
 	if (name === "schedule" || name === "workflow_dispatch") return { scheduled: true };
@@ -841,7 +844,7 @@ function modelConfig(env) {
 		provider,
 		apiKey: input(env, "model-key") ?? ""
 	};
-	if (!cfg.apiKey && provider !== "custom") throw new Error("model-key is empty. Add the model provider's key as a repository secret and pass it as model-key.");
+	if (!cfg.apiKey && provider !== "custom") throw new Error("model-key is empty: the secret the workflow passes as model-key is not set. Add it under the repository's Settings, Secrets and variables, Actions, as a repository secret with the name the workflow's model-key line uses (XAI_API_KEY for Grok).");
 	if (provider === "custom") {
 		cfg.base = input(env, "base-url");
 		cfg.model = input(env, "model");

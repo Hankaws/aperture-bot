@@ -158084,6 +158084,27 @@ function endpointOf(cfg) {
 		model: modelOf(cfg.provider)
 	};
 }
+/**
+* A provider's refusal, with what it said: "gemini refused the request (404):
+* models/x is not found" says which setting to change, where a bare status
+* does not. The key never appears, even if a provider echoes it.
+*/
+async function refused(name, res, apiKey) {
+	let said = "";
+	try {
+		const text = await res.text();
+		let parsed = null;
+		try {
+			parsed = JSON.parse(text);
+		} catch {}
+		const error = (Array.isArray(parsed) ? parsed[0] : parsed)?.error;
+		const message = typeof error === "string" ? error : error?.message;
+		said = (typeof message === "string" ? message : parsed === null ? text : "").replace(/\s+/g, " ").trim();
+		if (apiKey) said = said.split(apiKey).join("[key]");
+	} catch {}
+	const detail = said ? `: ${said.length > 240 ? `${said.slice(0, 239)}…` : said}` : ".";
+	return /* @__PURE__ */ new Error(`${name} refused the request (${res.status})${detail}`);
+}
 async function postChat(cfg, body, signal) {
 	const { base, model } = endpointOf(cfg);
 	const headers = { "Content-Type": "application/json" };
@@ -158103,15 +158124,16 @@ async function postChat(cfg, body, signal) {
 		redirect: "manual"
 	});
 	if (!res.ok) {
+		const error = await refused(cfg.provider === "custom" ? "Endpoint" : cfg.provider, res, cfg.apiKey);
 		await pinned?.close();
-		throw new Error(`${cfg.provider === "custom" ? "Endpoint" : cfg.provider} refused the request (${res.status}).`);
+		throw error;
 	}
 	return res;
 }
 function modelOf(provider) {
 	if (provider === "openai") return "gpt-4o";
-	if (provider === "anthropic") return "claude-sonnet-4-5";
-	if (provider === "gemini") return "gemini-2.5-flash";
+	if (provider === "anthropic") return ANTHROPIC_MODEL;
+	if (provider === "gemini") return "gemini-3.8-flash";
 	if (provider === "deepseek") return "deepseek-chat";
 	return "grok-4.5";
 }
@@ -158120,6 +158142,24 @@ function openaiCompatBase(provider) {
 	if (provider === "gemini") return "https://generativelanguage.googleapis.com/v1beta/openai";
 	if (provider === "deepseek") return "https://api.deepseek.com/v1";
 	return "https://api.x.ai/v1";
+}
+/**
+* Claude Opus 5.5. Its thinking is always on and counts toward `max_tokens`,
+* so the limits leave room for it; effort is set rather than left to the
+* model's default. A request the model declines is retried on the model
+* Anthropic picks for that kind of decline (`fallbacks: "default"`).
+*/
+const ANTHROPIC_MODEL = "claude-opus-5-5";
+const ANTHROPIC_HEADERS = (apiKey) => ({
+	"Content-Type": "application/json",
+	"x-api-key": apiKey,
+	"anthropic-version": "2023-06-01",
+	"anthropic-beta": "server-side-fallback-2026-07-01"
+});
+/** A request every model declined: say so, rather than answer with nothing. */
+function anthropicRefusal(details) {
+	const why = details?.category ? ` (${details.category})` : "";
+	return /* @__PURE__ */ new Error(`Claude declined this request${why}. Rephrase the task, or pick another model.`);
 }
 function asAnthropicTools(tools) {
 	return tools.map((t) => ({
@@ -158154,24 +158194,23 @@ async function complete(cfg, messages, useTools, signal, tools = AGENT_TOOLS) {
 async function completeAnthropic(apiKey, messages, useTools, signal, tools = AGENT_TOOLS) {
 	const { system, converted } = toAnthropic(messages);
 	const body = {
-		model: "claude-sonnet-4-5",
-		max_tokens: 1800,
+		model: ANTHROPIC_MODEL,
+		max_tokens: 16e3,
+		output_config: { effort: "medium" },
+		fallbacks: "default",
 		system,
 		messages: converted
 	};
 	if (useTools) body.tools = asAnthropicTools(tools);
 	const res = await fetch("https://api.anthropic.com/v1/messages", {
 		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"x-api-key": apiKey,
-			"anthropic-version": "2023-06-01"
-		},
+		headers: ANTHROPIC_HEADERS(apiKey),
 		body: JSON.stringify(body),
 		signal
 	});
-	if (!res.ok) throw new Error(`anthropic refused the request (${res.status}).`);
+	if (!res.ok) throw await refused("anthropic", res, apiKey);
 	const data = await res.json();
+	if (data.stop_reason === "refusal") throw anthropicRefusal(data.stop_details);
 	const text = data.content.filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
 	const tool_calls = data.content.filter((b) => b.type === "tool_use").map((b) => ({
 		id: b.id ?? "call",
