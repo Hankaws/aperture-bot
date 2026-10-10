@@ -1,4 +1,4 @@
-const require_run = require("./run-BXPp-VLX.cjs");
+const require_run = require("./run-CK4kn0uA.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_child_process = require("node:child_process");
@@ -33,10 +33,15 @@ function taskFrom(body, trigger = DEFAULT_TRIGGER) {
 	if (rest !== "" && !/^\s/.test(rest)) return null;
 	return rest.trim();
 }
+/** `/aperture check`: the whole task is the word, so "check the login flow" stays a task. */
+function isCheck(task) {
+	return /^check[.!]?$/i.test(task.trim());
+}
 function parseEvent(name, payload, trigger = DEFAULT_TRIGGER, label = DEFAULT_LABEL) {
 	if (name === "schedule" || name === "workflow_dispatch") return { scheduled: true };
 	if (name === "issues") return labelled(payload, label);
-	if (name !== "issue_comment") return { ignored: `${name} events are not commands; the bot answers comments, its label and its schedule.` };
+	if (name === "pull_request") return pushed(payload);
+	if (name !== "issue_comment") return { ignored: `${name} events are not commands; the bot answers comments, its label, its schedule and pull requests.` };
 	const event = payload ?? {};
 	if (event.action !== "created") return { ignored: "only new comments are commands, not edits." };
 	const user = event.comment?.user;
@@ -47,15 +52,48 @@ function parseEvent(name, payload, trigger = DEFAULT_TRIGGER, label = DEFAULT_LA
 	const repo = event.repository;
 	if (!issue?.number || !event.comment?.id || !user?.login || !repo?.name || !repo.owner?.login) return { ignored: "the event is missing the issue, comment or repository." };
 	const title = issue.title ?? "";
+	const check = isCheck(task);
 	return { command: {
 		number: issue.number,
 		isPull: Boolean(issue.pull_request),
 		title,
 		body: issue.body ?? "",
-		task: task || `Do what this ${issue.pull_request ? "pull request" : "issue"} asks: ${title}`,
+		task: check ? "Check this pull request" : task || `Do what this ${issue.pull_request ? "pull request" : "issue"} asks: ${title}`,
 		commentId: event.comment.id,
 		author: user.login,
 		via: "comment",
+		...check ? { check: true } : {},
+		owner: repo.owner.login,
+		repo: repo.name,
+		defaultBranch: repo.default_branch ?? "main"
+	} };
+}
+/** The pull requests that change: checked on every push, for whoever pushed. */
+const PULL_ACTIONS = /* @__PURE__ */ new Set([
+	"opened",
+	"synchronize",
+	"reopened",
+	"ready_for_review"
+]);
+/** A pull request opened or pushed to: check it, as the "check every pull request" job. */
+function pushed(payload) {
+	const event = payload ?? {};
+	if (!PULL_ACTIONS.has(event.action ?? "")) return { ignored: `a pull request ${event.action ?? "event"} changes no code to check.` };
+	if (event.sender?.type === "Bot") return { ignored: "pushes by bots are not checked." };
+	const pull = event.pull_request;
+	const repo = event.repository;
+	if (!pull?.number || !event.sender?.login || !repo?.name || !repo.owner?.login) return { ignored: "the event is missing the pull request, sender or repository." };
+	if (pull.draft) return { ignored: "drafts are checked once they are ready for review." };
+	return { command: {
+		number: pull.number,
+		isPull: true,
+		title: pull.title ?? "",
+		body: pull.body ?? "",
+		task: "Check this pull request",
+		commentId: null,
+		author: event.sender.login,
+		via: "pull",
+		check: true,
 		owner: repo.owner.login,
 		repo: repo.name,
 		defaultBranch: repo.default_branch ?? "main"
@@ -147,8 +185,23 @@ var GitHub = class {
 	async react(commentId, content) {
 		await this.call("POST", `${this.base}/issues/comments/${commentId}/reactions`, { content });
 	}
+	/**
+	* Every page of a list, oldest first as GitHub gives them, up to `max`
+	* pages of 100: one page would miss the newest comments on a long thread,
+	* or a job's tracking issue in a busy repository.
+	*/
+	async all(path, max = 10) {
+		const out = [];
+		const sep = path.includes("?") ? "&" : "?";
+		for (let page = 1; page <= max; page++) {
+			const items = await this.call("GET", `${path}${sep}per_page=100&page=${page}`);
+			out.push(...items);
+			if (items.length < 100) break;
+		}
+		return out;
+	}
 	async comments(issue) {
-		return (await this.call("GET", `${this.base}/issues/${issue}/comments?per_page=100`)).map((c) => ({
+		return (await this.all(`${this.base}/issues/${issue}/comments`)).map((c) => ({
 			id: c.id,
 			author: c.user?.login ?? "someone",
 			authorType: c.user?.type ?? "User",
@@ -217,7 +270,7 @@ var GitHub = class {
 		return out;
 	}
 	async openIssues() {
-		return (await this.call("GET", `${this.base}/issues?state=open&per_page=100`)).map((i) => ({
+		return (await this.all(`${this.base}/issues?state=open`)).map((i) => ({
 			number: i.number,
 			title: i.title,
 			isPull: Boolean(i.pull_request)
@@ -231,7 +284,7 @@ var GitHub = class {
 	}
 	/** Open pull requests from this repository's branches: their branch and page. */
 	async openPulls() {
-		return (await this.call("GET", `${this.base}/pulls?state=open&per_page=100`)).map((p) => ({
+		return (await this.all(`${this.base}/pulls?state=open`)).map((p) => ({
 			headRef: p.head.ref,
 			url: p.html_url
 		}));
@@ -247,6 +300,129 @@ function canWrite(permission) {
 		"maintain",
 		"write"
 	].includes(permission);
+}
+//#endregion
+//#region src/lib/bot/summary.ts
+const OPEN = "<!-- aperture-bot ";
+const CLOSE = " -->";
+const LIMITS = {
+	plan: 7,
+	checks: 30,
+	files: 100,
+	text: 300,
+	error: 1e3
+};
+const clip = (text, max) => text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+/** The summary kept to a size a comment can always carry. */
+function bounded(summary) {
+	return {
+		...summary,
+		plan: summary.plan?.slice(0, LIMITS.plan).map((step) => clip(step, LIMITS.text)),
+		checks: summary.checks?.slice(0, LIMITS.checks).map((row) => ({
+			status: row.status,
+			label: clip(row.label, LIMITS.text),
+			detail: clip(row.detail, LIMITS.text)
+		})),
+		files: summary.files?.slice(0, LIMITS.files),
+		task: summary.task === void 0 ? void 0 : clip(summary.task, LIMITS.error),
+		error: summary.error === void 0 ? void 0 : clip(summary.error, LIMITS.error)
+	};
+}
+/**
+* The hidden line. `<` and `>` are written as JSON escapes, so nothing in the
+* text can end the HTML comment early.
+*/
+function summaryMarker(summary) {
+	const json = JSON.stringify(bounded(summary)).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
+	return `${OPEN}${json}${CLOSE}`;
+}
+const STATES = /* @__PURE__ */ new Set([
+	"working",
+	"clear",
+	"red",
+	"stopped",
+	"no-change",
+	"declined",
+	"error"
+]);
+function isString(value) {
+	return typeof value === "string";
+}
+const strings = (value) => Array.isArray(value) ? value.filter(isString) : void 0;
+/**
+* The summary a comment carries, or null when it has none. Comments are
+* written by anyone who can comment, so every field is checked, and only a
+* github.com link is kept.
+*/
+function readSummary(body) {
+	const start = body.lastIndexOf(OPEN);
+	if (start < 0) return null;
+	const end = body.indexOf(CLOSE, start + 18);
+	if (end < 0) return null;
+	let raw;
+	try {
+		raw = JSON.parse(body.slice(start + 18, end));
+	} catch {
+		return null;
+	}
+	if (typeof raw !== "object" || raw === null) return null;
+	const r = raw;
+	if (r.v !== 1 || typeof r.state !== "string" || !STATES.has(r.state)) return null;
+	if (typeof r.asked !== "number" || !Number.isSafeInteger(r.asked)) return null;
+	const out = {
+		v: 1,
+		state: r.state,
+		asked: r.asked,
+		run: isGithubUrl(r.run) ? r.run : ""
+	};
+	if (r.kind === "check") out.kind = "check";
+	if (r.via === "label" || r.via === "schedule" || r.via === "pull") out.via = r.via;
+	if (typeof r.by === "string") out.by = r.by.slice(0, 100);
+	if (typeof r.task === "string") out.task = r.task;
+	if (typeof r.phase === "string" && r.phase in PHASE_TEXT) out.phase = r.phase;
+	if (typeof r.round === "number") out.round = r.round;
+	if (typeof r.rounds === "number") out.rounds = r.rounds;
+	out.plan = strings(r.plan);
+	out.files = strings(r.files);
+	if (Array.isArray(r.checks)) out.checks = r.checks.flatMap((row) => {
+		const c = row;
+		return typeof c?.status === "string" && typeof c.label === "string" && typeof c.detail === "string" ? [{
+			status: c.status,
+			label: c.label,
+			detail: c.detail
+		}] : [];
+	});
+	const link = r.link;
+	if (link && isGithubUrl(link.url) && (link.what === "pull" || link.what === "commit")) out.link = {
+		url: link.url,
+		what: link.what
+	};
+	if (typeof r.tests === "string" || r.tests === null) out.tests = r.tests;
+	if (typeof r.usage === "string") out.usage = r.usage;
+	if (typeof r.error === "string") out.error = r.error;
+	return out;
+}
+function isGithubUrl(value) {
+	if (typeof value !== "string") return false;
+	try {
+		const url = new URL(value);
+		return url.protocol === "https:" && url.hostname === "github.com";
+	} catch {
+		return false;
+	}
+}
+/** What the bot is doing, in a few words. */
+const PHASE_TEXT = {
+	starting: "Reading the thread and setting up",
+	planning: "Planning the change",
+	building: "Making the change",
+	checking: "Running Aperture Agent Check",
+	fixing: "Fixing what Agent Check found",
+	publishing: "Agent Check is clear: publishing"
+};
+/** The phase as a line, with the round when there is one. */
+function phaseLine(summary) {
+	return `${PHASE_TEXT[summary.phase ?? "starting"]}${(summary.phase === "checking" || summary.phase === "fixing") && summary.round ? ` (round ${summary.round}${summary.rounds ? ` of ${summary.rounds}` : ""})` : ""}.`;
 }
 //#endregion
 //#region packages/aperture-bot/src/publish.ts
@@ -304,6 +480,23 @@ function checkoutPullHead(cwd, ref) {
 		`refs/remotes/origin/${ref}`
 	], cwd);
 }
+/**
+* Fetches a pull request's base branch, with the history Agent Check needs to
+* find where the two meet: actions/checkout clones one commit deep, so a
+* shallow checkout is deepened first. Returns the ref to compare against.
+*/
+function fetchBase(cwd, ref) {
+	const spec = `+refs/heads/${ref}:refs/remotes/origin/${ref}`;
+	const shallow = require_run.git(["rev-parse", "--is-shallow-repository"], cwd).trim() === "true";
+	require_run.git([
+		"fetch",
+		"--no-tags",
+		...shallow ? ["--unshallow"] : [],
+		"origin",
+		spec
+	], cwd);
+	return `refs/remotes/origin/${ref}`;
+}
 /** Commits exactly `paths` (relative to `cwd`) and returns the commit. */
 function commitFiles(cwd, paths, message, author = BOT_AUTHOR) {
 	require_run.git([
@@ -348,59 +541,7 @@ function diffOf(cwd, paths, max = 3e4) {
 	return diff.length <= max ? diff : `${diff.slice(0, max)}\n… (cut at ${max} characters)`;
 }
 //#endregion
-//#region src/lib/bot/summary.ts
-const OPEN = "<!-- aperture-bot ";
-const CLOSE = " -->";
-const LIMITS = {
-	plan: 7,
-	checks: 30,
-	files: 100,
-	text: 300,
-	error: 1e3
-};
-const clip = (text, max) => text.length <= max ? text : `${text.slice(0, max - 1)}…`;
-/** The summary kept to a size a comment can always carry. */
-function bounded(summary) {
-	return {
-		...summary,
-		plan: summary.plan?.slice(0, LIMITS.plan).map((step) => clip(step, LIMITS.text)),
-		checks: summary.checks?.slice(0, LIMITS.checks).map((row) => ({
-			status: row.status,
-			label: clip(row.label, LIMITS.text),
-			detail: clip(row.detail, LIMITS.text)
-		})),
-		files: summary.files?.slice(0, LIMITS.files),
-		task: summary.task === void 0 ? void 0 : clip(summary.task, LIMITS.error),
-		error: summary.error === void 0 ? void 0 : clip(summary.error, LIMITS.error)
-	};
-}
-/**
-* The hidden line. `<` and `>` are written as JSON escapes, so nothing in the
-* text can end the HTML comment early.
-*/
-function summaryMarker(summary) {
-	const json = JSON.stringify(bounded(summary)).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
-	return `${OPEN}${json}${CLOSE}`;
-}
-/** What the bot is doing, in a few words. */
-const PHASE_TEXT = {
-	starting: "Reading the thread and setting up",
-	planning: "Planning the change",
-	building: "Making the change",
-	checking: "Running Aperture Agent Check",
-	fixing: "Fixing what Agent Check found",
-	publishing: "Agent Check is clear: publishing"
-};
-/** The phase as a line, with the round when there is one. */
-function phaseLine(summary) {
-	return `${PHASE_TEXT[summary.phase ?? "starting"]}${(summary.phase === "checking" || summary.phase === "fixing") && summary.round ? ` (round ${summary.round}${summary.rounds ? ` of ${summary.rounds}` : ""})` : ""}.`;
-}
-//#endregion
 //#region packages/aperture-bot/src/replies.ts
-/**
-* What the bot says on GitHub: the body of the pull request it opens, and its
-* replies on the thread. Pure, so every wording is tested without a network.
-*/
 const MARK = {
 	pass: "✓",
 	fail: "✗",
@@ -414,6 +555,7 @@ const SITE = "https://aperturesais.grok.me";
 function askedBy(command) {
 	if (command.via === "label") return `@${command.author} labelled #${command.number} for the bot`;
 	if (command.via === "schedule") return `A standing job, on #${command.number}`;
+	if (command.via === "pull") return `@${command.author} pushed to #${command.number}`;
 	return `@${command.author} asked in #${command.number}`;
 }
 /** The fields of a summary that say who asked, when no comment did. */
@@ -540,6 +682,20 @@ function forkReply(ctx) {
 		run: ctx.run
 	})]);
 }
+/** `/aperture check` on an issue: there is no change to check. */
+function notPullReply(ctx) {
+	return join$1([
+		"`/aperture check` runs Aperture Agent Check on a pull request, and this is an issue, so there is nothing to check.",
+		"",
+		"Comment it on the pull request instead, or say what to do after `/aperture` and the bot will make the change."
+	], [summaryMarker({
+		v: 1,
+		state: "declined",
+		kind: "check",
+		asked: ctx.asked,
+		run: ctx.run
+	})]);
+}
 function errorReply(message, ctx) {
 	return join$1([
 		"Aperture Bot stopped with an error and changed nothing:",
@@ -552,6 +708,28 @@ function errorReply(message, ctx) {
 		run: ctx.run,
 		...askedFields(ctx),
 		error: message
+	})]);
+}
+/**
+* Aperture Agent Check on a pull request, asked with `/aperture check` or by a
+* push: its report, and nothing changed.
+*/
+function checkReply(check, ctx) {
+	const report = check.rows.length > 0 ? require_run.summaryMarkdown(check.rows, check.meta).trim() : `### Aperture Agent Check\n\n${check.text.replace(/^Aperture Agent Check: /, "")}`;
+	const tests = ctx.tests ? `Tests ran ${ctx.tests}.` : "Tests were not run.";
+	return join$1([report], [`${tests} Nothing was changed. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
+		v: 1,
+		state: check.verdict,
+		kind: "check",
+		asked: ctx.asked,
+		run: ctx.run,
+		...askedFields(ctx),
+		checks: require_run.shownRows(check.rows).map((r) => ({
+			status: r.status,
+			label: r.label,
+			detail: r.detail
+		})),
+		tests: ctx.tests
 	})]);
 }
 //#endregion
@@ -628,7 +806,8 @@ async function planJob(gh, job, repo) {
 * The bot runs it on the checkout and, only when Aperture Agent Check is
 * clear, opens a pull request (asked on an issue) or pushes to the pull
 * request (asked on one). Otherwise it replies with what it tried and why it
-* stopped.
+* stopped. `/aperture check` on a pull request, or a push to one, runs Agent
+* Check alone and replies with its report: no model, and no change.
 *
 * Settings arrive as INPUT_* variables, as GitHub passes an action's inputs.
 */
@@ -793,7 +972,62 @@ async function runAction(env, deps = {}) {
 		edits = edits.then(() => gh.editComment(id, workingReply(progress, asked))).catch(() => void 0);
 		return edits;
 	};
+	const sandboxFor = async () => deps.sandbox !== void 0 ? deps.sandbox : await prepareDocker(input(env, "sandbox-image") ?? "mirror.gcr.io/library/node:22-slim", log);
+	/**
+	* Agent Check on the pull request's head, against its base: the report is
+	* the reply. A push's report replaces the last push's, so the thread keeps
+	* one, not one per push.
+	*/
+	const checkPull = async () => {
+		if (!command.isPull) {
+			await gh.comment(command.number, notPullReply(asked));
+			setOutput(env, { outcome: "declined" });
+			return 0;
+		}
+		const pull = await gh.pull(command.number);
+		if (pull.headRepo.toLowerCase() !== `${command.owner}/${command.repo}`.toLowerCase()) {
+			await gh.comment(command.number, forkReply(asked));
+			setOutput(env, { outcome: "declined" });
+			return 0;
+		}
+		const working = workingReply({ phase: "checking" }, asked);
+		if (command.via === "pull") {
+			const earlier = (await gh.comments(command.number)).filter((c) => {
+				const s = c.authorType === "Bot" ? readSummary(c.body) : null;
+				return s?.kind === "check" && s.via === "pull";
+			}).at(-1);
+			if (earlier) status = await gh.editComment(earlier.id, working).then(() => earlier.id).catch(() => null);
+		}
+		if (status === null) status = await gh.comment(command.number, working).then((posted) => Number.isSafeInteger(posted.id) ? posted.id : null).catch(() => null);
+		checkoutPullHead(cwd, pull.headRef);
+		const base = fetchBase(cwd, pull.baseRef);
+		install(cwd, input(env, "install") ?? "auto", log);
+		const sandbox = await sandboxFor();
+		log(`Aperture Bot: checking #${command.number} for @${command.author}`);
+		const result = require_run.check({
+			cwd,
+			base,
+			runTests: sandbox !== null,
+			testScript: input(env, "test-script") ?? "test",
+			timeoutMs: number(env, "timeout-minutes", 10) * 6e4,
+			failOn: "red",
+			testRunner: sandbox ? require_run.asTestRunner(sandbox) : void 0,
+			testsWhere: sandbox?.where
+		});
+		log(result.text);
+		if (env.GITHUB_STEP_SUMMARY) (0, node_fs.appendFileSync)(env.GITHUB_STEP_SUMMARY, result.rows.length > 0 ? require_run.summaryMarkdown(result.rows, result.meta) : `### Aperture Agent Check\n\n${result.text.replace(/^Aperture Agent Check: /, "")}\n`);
+		await reply(checkReply(result, {
+			...asked,
+			tests: sandbox?.where ?? null
+		}));
+		setOutput(env, {
+			outcome: result.verdict,
+			verdict: result.verdict
+		});
+		return result.exitCode;
+	};
 	try {
+		if (command.check) return await checkPull();
 		const model = modelConfig(env);
 		let pull = null;
 		let diff = null;
@@ -814,7 +1048,7 @@ async function runAction(env, deps = {}) {
 			diff = await gh.diff(command.number);
 		}
 		install(cwd, input(env, "install") ?? "auto", log);
-		const sandbox = deps.sandbox !== void 0 ? deps.sandbox : await prepareDocker(input(env, "sandbox-image") ?? "mirror.gcr.io/library/node:22-slim", log);
+		const sandbox = await sandboxFor();
 		const comments = await gh.comments(command.number);
 		log(`Aperture Bot: working on #${command.number} for @${command.author}: ${command.task}`);
 		const result = await require_run.runTask({

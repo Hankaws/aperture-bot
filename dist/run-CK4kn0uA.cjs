@@ -153880,6 +153880,27 @@ function consoleText(rows, meta) {
 	if (meta.notChecked.length > 0) lines.push("", `Not checked: ${meta.notChecked.length} changed file(s) that are not JavaScript, TypeScript, JSON, HTML or CSS, or are over 1 MB.`);
 	return lines.join("\n");
 }
+const cell = (text) => text.replace(/\|/g, "\\|").replace(/\n/g, " ");
+/** Markdown for the run's summary page. */
+function summaryMarkdown(rows, meta) {
+	const lines = [
+		`### Aperture Agent Check`,
+		"",
+		headline(rows, meta),
+		"",
+		"| | Check | Result |",
+		"|---|---|---|"
+	];
+	for (const row of shownRows(rows)) lines.push(`| ${MARK[row.status] ?? "?"} | ${cell(row.label)} | ${cell(row.detail)} |`);
+	const red = shownRows(rows).filter((row) => row.status === "fail" && row.evidence);
+	for (const row of red) lines.push("", `<details><summary>${cell(row.label)}: everything it found</summary>`, "", "```", row.evidence.slice(0, 2e4), "```", "", "</details>");
+	if (meta.notChecked.length > 0) {
+		const shown = meta.notChecked.slice(0, 20).map((path) => `\`${path}\``).join(", ");
+		lines.push("", `Not checked: ${shown}${meta.notChecked.length > 20 ? `, and ${meta.notChecked.length - 20} more` : ""}.`);
+	}
+	lines.push("", "Same checks as the [Aperture](https://aperturesais.grok.me/bot?tab=check) editor. Nothing left this runner.");
+	return `${lines.join("\n")}\n`;
+}
 //#endregion
 //#region packages/agent-check/src/tests.ts
 /**
@@ -158709,6 +158730,18 @@ Object.defineProperty(exports, "DEFAULT_IMAGE", {
 		return DEFAULT_IMAGE;
 	}
 });
+Object.defineProperty(exports, "asTestRunner", {
+	enumerable: true,
+	get: function() {
+		return asTestRunner;
+	}
+});
+Object.defineProperty(exports, "check", {
+	enumerable: true,
+	get: function() {
+		return check;
+	}
+});
 Object.defineProperty(exports, "chooseSandbox", {
 	enumerable: true,
 	get: function() {
@@ -158749,5 +158782,11 @@ Object.defineProperty(exports, "shownRows", {
 	enumerable: true,
 	get: function() {
 		return shownRows;
+	}
+});
+Object.defineProperty(exports, "summaryMarkdown", {
+	enumerable: true,
+	get: function() {
+		return summaryMarkdown;
 	}
 });
