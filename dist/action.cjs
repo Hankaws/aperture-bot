@@ -1,4 +1,4 @@
-const require_run = require("./run-63Xqn35Z.cjs");
+const require_run = require("./run-MOmdgHVV.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_child_process = require("node:child_process");
@@ -313,7 +313,8 @@ const LIMITS = {
 	checks: 30,
 	files: 100,
 	text: 300,
-	error: 1e3
+	error: 1e3,
+	next: 3
 };
 const clip = (text, max) => text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 /** The summary kept to a size a comment can always carry. */
@@ -327,6 +328,7 @@ function bounded(summary) {
 			detail: clip(row.detail, LIMITS.text)
 		})),
 		files: summary.files?.slice(0, LIMITS.files),
+		next: summary.next?.slice(0, LIMITS.next).map((task) => clip(task, LIMITS.text)),
 		task: summary.task === void 0 ? void 0 : clip(summary.task, LIMITS.error),
 		error: summary.error === void 0 ? void 0 : clip(summary.error, LIMITS.error)
 	};
@@ -387,6 +389,8 @@ function readSummary(body) {
 	if (typeof r.rounds === "number") out.rounds = r.rounds;
 	out.plan = strings(r.plan);
 	out.files = strings(r.files);
+	const next = strings(r.next)?.slice(0, LIMITS.next).map((task) => clip(task, LIMITS.text));
+	if (next?.length) out.next = next;
 	if (Array.isArray(r.checks)) out.checks = r.checks.flatMap((row) => {
 		const c = row;
 		return typeof c?.status === "string" && typeof c.label === "string" && typeof c.detail === "string" ? [{
@@ -620,8 +624,19 @@ function resultSummary(result, ctx, link) {
 		link,
 		tests: ctx.tests,
 		usage: result.usage,
-		error: result.error
+		error: result.error,
+		...result.next.length ? { next: result.next } : {}
 	};
+}
+/** What the bot would do next, as a list the maintainer can ask for. */
+function nextList(result) {
+	if (result.next.length === 0) return [];
+	return [
+		"**Next, I would suggest**",
+		...result.next.map((task) => `- ${task}`),
+		"",
+		"Ask for one with `/aperture` and the task, or send it from the Bot page. Nothing is done until you do."
+	];
 }
 const join$1 = (...blocks) => blocks.filter((b) => b.length > 0).map((b) => b.join("\n")).join("\n\n");
 function commitMessage(command, result) {
@@ -653,7 +668,7 @@ function workingReply(progress, ctx) {
 function doneReply(result, link, ctx) {
 	const files = result.written.map((p) => `\`${p}\``).join(", ");
 	const text = link.what === "pull" ? `Opened ${link.url}, changing ${files}. Aperture Agent Check found nothing red.` : `Pushed ${link.url} to this pull request, changing ${files}. Aperture Agent Check found nothing red.`;
-	return join$1([text], plan(result), [footer(result, ctx.run, ctx.tests)], [summaryMarker(resultSummary(result, ctx, link))]);
+	return join$1([text], plan(result), nextList(result), [footer(result, ctx.run, ctx.tests)], [summaryMarker(resultSummary(result, ctx, link))]);
 }
 const OUTCOME = {
 	red: "I made a change, but Aperture Agent Check is still red after my fixes, so I did not push it.",
@@ -671,7 +686,7 @@ function notDoneReply(result, diff, ctx) {
 		"```",
 		"",
 		"</details>"
-	] : [], agentSaid(result), [footer(result, ctx.run, ctx.tests)], [summaryMarker(resultSummary(result, ctx))]);
+	] : [], agentSaid(result), nextList(result), [footer(result, ctx.run, ctx.tests)], [summaryMarker(resultSummary(result, ctx))]);
 }
 function forkReply(ctx) {
 	return join$1([
