@@ -3,9 +3,9 @@ let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_module = require("node:module");
 let node_url = require("node:url");
+let node_crypto = require("node:crypto");
 let node_child_process = require("node:child_process");
 let node_os = require("node:os");
-let node_crypto = require("node:crypto");
 //#region node_modules/typescript/lib/typescript.js
 var require_typescript = /* @__PURE__ */ require_rolldown_runtime.__commonJSMin(((exports, module) => {
 	/*! *****************************************************************************
@@ -153095,7 +153095,7 @@ function tamperedRow(row, tampering) {
 function hookRow(run) {
 	const id = `hook:${run.hook.id}`;
 	const label = run.hook.name;
-	const command = `npm run ${run.hook.script}`;
+	const command = run.command ? `npm run ${run.hook.script} (\`${run.command}\`)` : `npm run ${run.hook.script}`;
 	if (run.state === "running") return {
 		id,
 		label,
@@ -153470,14 +153470,6 @@ function parseErrorsOf(result) {
 function tscIssue(diagnostic) {
 	return `TS${diagnostic.code} at line ${diagnostic.line}: ${diagnostic.message}`;
 }
-//#endregion
-//#region src/lib/workspace/tsc-paths.ts
-/**
-* Which files a change's type check reads: the changed TypeScript files and
-* the files that depend on them. Shared by the editor (tsc.ts) and the benchmark.
-*/
-/** A change to a widely used file still checks only this many of the files that depend on it. */
-const MAX_IMPORTERS = 40;
 /**
 * The changed TypeScript files and what depends on them, nearest first: files
 * that import or re-export a changed file, then the files that import those,
@@ -153495,10 +153487,10 @@ function pathsToCheck(after, changed) {
 	}
 	const importers = [];
 	let frontier = new Set(targets);
-	while (frontier.size > 0 && importers.length < MAX_IMPORTERS) {
+	while (frontier.size > 0 && importers.length < 40) {
 		const next = /* @__PURE__ */ new Set();
 		for (const [path, hits] of imports) {
-			if (reached.has(path) || importers.length >= MAX_IMPORTERS) continue;
+			if (reached.has(path) || importers.length >= 40) continue;
 			if (hits.some((hit) => frontier.has(hit))) {
 				reached.add(path);
 				importers.push(path);
@@ -153628,6 +153620,53 @@ function staticChangeChecks(input) {
 		tsc: tscCheck,
 		parse: tsParseCheck(input.tsc)
 	}), importers, input.before, after);
+}
+//#endregion
+//#region packages/agent-check/src/baseline.ts
+/**
+* A stored baseline for one base commit, so a flaky or slow base run is not
+* repeated while that commit stays the base. Off unless asked: the default
+* still recomputes the base every time.
+*/
+function baselineFile(dir, rev, script) {
+	const name = (0, node_crypto.createHash)("sha256").update(`${rev}\0${script}`).digest("hex").slice(0, 24);
+	return (0, node_path.join)(dir, `${name}.json`);
+}
+function readBaseline(dir, rev, script) {
+	try {
+		const raw = JSON.parse((0, node_fs.readFileSync)(baselineFile(dir, rev, script), "utf8"));
+		if (raw.rev !== rev || raw.script !== script || !raw.run || typeof raw.run.ran !== "boolean") return null;
+		return raw.run;
+	} catch {
+		return null;
+	}
+}
+function writeBaseline(dir, rev, script, run) {
+	(0, node_fs.mkdirSync)(dir, { recursive: true });
+	(0, node_fs.writeFileSync)(baselineFile(dir, rev, script), JSON.stringify({
+		rev,
+		script,
+		run
+	}));
+}
+/**
+* The base run to compare against. `cache` reuses a result stored for this
+* base commit and script, and writes one when it had to run.
+*/
+function baseFromCacheOrRun(mode, dir, rev, script, run) {
+	if (mode === "cache") {
+		const hit = readBaseline(dir, rev, script);
+		if (hit) return {
+			run: hit,
+			cached: true
+		};
+	}
+	const fresh = run();
+	if (mode === "cache" && fresh) writeBaseline(dir, rev, script, fresh);
+	return {
+		run: fresh,
+		cached: false
+	};
 }
 //#endregion
 //#region packages/agent-check/src/git.ts
@@ -154099,12 +154138,13 @@ function testsFor(options, rev) {
 		passed: true,
 		detail: ""
 	};
-	const base = runTestsAtBase(options.cwd, rev, options.testScript, options.timeoutMs, options.testRunner);
-	const preexisting = base !== null && base.ran && !base.passed;
+	const base = baseFromCacheOrRun(options.baseline, options.baselineDir, rev, options.testScript, () => runTestsAtBase(options.cwd, rev, options.testScript, options.timeoutMs, options.testRunner));
+	const preexisting = base.run !== null && base.run.ran && !base.run.passed;
+	const note = base.cached ? " Compared with a cached baseline for this base." : "";
 	return {
 		...done,
 		passed: false,
-		detail: head.detail,
+		detail: `${head.detail}${note}`,
 		evidence: head.evidence,
 		preexisting
 	};
@@ -156914,9 +156954,9 @@ function verifyRecap(edits, files, plan = [], parse) {
 	const leftover = [];
 	for (const symbol of [...new Set(edits.flatMap(symbolsFromEdit))].slice(0, 5)) {
 		const hits = filesMentioning(files, symbol, skip);
-		if (hits.length) leftover.push(`${symbol} still in ${hits.slice(0, 2).join(", ")}`);
+		if (hits.length) leftover.push(`${symbol} also appears in ${hits.slice(0, 2).join(", ")}`);
 	}
-	const line2 = leftover.length ? `Didn't: ${leftover.slice(0, 2).join("; ")}` : "Didn't: no other files mention the changed names.";
+	const line2 = leftover.length ? `Elsewhere: ${leftover.slice(0, 2).join("; ")}` : "Elsewhere: no other file mentions the changed names.";
 	const tracked = plan.some((e) => e.status !== "pending");
 	const open = plan.filter((e) => e.status !== "completed").map((e) => e.content);
 	const line3 = !tracked ? "" : open.length ? `Left: ${open.slice(0, 2).join("; ")}` : "Left: nothing on the plan.";
@@ -156984,6 +157024,24 @@ const DENY = /* @__PURE__ */ new Set([
 	"serve",
 	"watch"
 ]);
+[
+	{
+		host: "registry.npmjs.org",
+		why: "npm package metadata and tarballs"
+	},
+	{
+		host: "*.npmjs.org",
+		why: "npm's other registry hosts"
+	},
+	{
+		host: "registry.yarnpkg.com",
+		why: "Yarn's registry"
+	},
+	{
+		host: "codeload.github.com",
+		why: "GitHub tarballs some installs download"
+	}
+].map((entry) => entry.host);
 function declaredScripts(files) {
 	const raw = files["package.json"];
 	if (!raw) return [];
@@ -157819,8 +157877,8 @@ function writeTexts(cwd, texts) {
 * run_script("test") as a model checking its work would. When the tab runs it
 * in the browser, the output comes back as the next turn and the answer
 * repeats what the run said, pass or fail. Otherwise the loop's own verify
-* step reports the result. A failed run is reported as a failure, never
-* papered over: a recording cannot write a new fix.
+* step reports the result. A failed check can play one recorded second try
+* that is still wrong, and then stops. It never invents a fix that passes.
 *
 * Pure: tests import it directly.
 */
@@ -157884,6 +157942,28 @@ const TAPES = [
 		}],
 		doneText: "Staged the check in `requireTitle` (src/lib/validate.ts): a trimmed title over 80 characters now gets a 400 `invalid_title`.",
 		answer: "`requireTitle` in src/lib/validate.ts rejects empty titles but accepts any length. A length check there would cover POST /tasks."
+	},
+	{
+		id: "list-bad-return",
+		title: "Make listTasks return a number",
+		match: /make listtasks return a number/i,
+		reads: [read("src/store.ts")],
+		plan: ["Change the return of listTasks in src/store.ts to a number", "Leave the function's declared return type as it is"],
+		planText: "`listTasks` is declared to return `Task[]`. This change returns a number instead, which the type check should refuse.",
+		edits: [{
+			path: "src/store.ts",
+			search: "  return tasks.slice(start + 1, start + pageSize + 1);",
+			replace: "  return 1;",
+			description: "Return a number from listTasks"
+		}],
+		again: [{
+			path: "src/store.ts",
+			search: "  return 1;",
+			replace: "  return \"none\";",
+			description: "Return a string from listTasks"
+		}],
+		doneText: "Staged a return of `1` from `listTasks` (src/store.ts). The function is still declared to return `Task[]`.",
+		answer: "`listTasks` in src/store.ts returns a page of tasks. Returning a number there does not typecheck."
 	}
 ];
 /** The general question tape: the demo's known bugs, for "find bugs" or "explain this". */
@@ -157911,13 +157991,84 @@ const FALLBACK = [
 	"Add a model key in Settings, or turn replay off, for anything else."
 ].join("\n");
 const FIX_PROMPT_PREFIX = "Your edits do not pass";
-/** Inline edits paste the reply straight into code, so replay refuses them rather than insert prose. */
-const REPLAY_INLINE_ERROR = "Inline edits need a real model. The replay model only plays back recorded Composer tasks.";
+/** The editor's Send back prompt ends with this. A replay must not invent a passing fix. */
+const CHECK_FIX_MARK = "Fix only this with propose_edit";
+function isFailedFixAsk(text) {
+	return text.startsWith(FIX_PROMPT_PREFIX) || text.includes(CHECK_FIX_MARK);
+}
+/**
+* Inline edits paste the reply straight into code, so replay answers one only
+* with a recorded fix and otherwise says why, rather than insert prose.
+*/
+const REPLAY_INLINE_ERROR = "The replay model only knows the demo's recorded fixes. Select a line one of them changes (the return in listTasks in src/store.ts, the \"Should be 404\" line in src/routes/tasks.ts, or the return in requireTitle in src/lib/validate.ts) and ask to fix it. Add a model key for anything else.";
+/** A fix ask. The inline box's instruction must say so, or name the tape's task. */
+const FIX_ASK = /\b(fix|bug|wrong|correct|repair|broken)/i;
+const lines = (text) => text.replace(/\n$/, "").split("\n");
+/**
+* The replacement for a selection that a recorded fix changes, or null.
+*
+* The selection may be the whole recorded span or more (the span is replaced
+* inside it), or some of its lines, as long as it holds every code line the
+* fix removes (a comment the fix drops may stay outside it). Lines the
+* selection leaves out that the fix keeps unchanged at either end are not
+* repeated, so the file ends up as the recorded fix leaves it, or with only
+* the dropped comment left over.
+*/
+function inlineFix(edit, selected) {
+	if (selected.includes(edit.search)) return selected.replace(edit.search, edit.replace);
+	const search = lines(edit.search);
+	const sel = lines(selected);
+	const want = sel.map((line) => line.trim());
+	const at = search.findIndex((_, i) => want.every((line, j) => search[i + j]?.trim() === line));
+	if (at < 0 || !want.some(Boolean)) return null;
+	const kept = new Set(lines(edit.replace).map((line) => line.trim()));
+	const removed = search.filter((line) => !kept.has(line.trim()));
+	const code = removed.filter((line) => !/^\s*(\/\/|\/\*|\*)/.test(line));
+	const inSel = new Set(want);
+	if (!(code.length ? code : removed).every((line) => inSel.has(line.trim()))) return null;
+	let out = lines(edit.replace);
+	const before = search.slice(0, at);
+	const after = search.slice(at + sel.length);
+	while (before.length && out.length && before[0] === out[0]) {
+		before.shift();
+		out.shift();
+	}
+	while (after.length && out.length && after.at(-1) === out.at(-1)) {
+		after.pop();
+		out.pop();
+	}
+	if (!out.length) return null;
+	const indent = (search[at] ?? "").length - (search[at] ?? "").trimStart().length;
+	const selIndent = sel[0].length - sel[0].trimStart().length;
+	if (selIndent < indent) out = [out[0].slice(indent - selIndent), ...out.slice(1)];
+	return out.join("\n") + (selected.endsWith("\n") ? "\n" : "");
+}
+/**
+* An inline edit in replay: the loop's inline prompt carries the instruction
+* and the selected code. A tape that is a fix (not the recorded bad change)
+* answers when the ask is a fix and the selection is code that fix changes.
+*/
+function replayInline(messages) {
+	const ask = [...messages].reverse().find((m) => m.role === "user" && typeof m.content === "string")?.content ?? "";
+	const instruction = /^Instruction: (.*)$/m.exec(ask)?.[1] ?? "";
+	const selected = /\n\nSelected code:\n\n([\s\S]*?)\n\nSurrounding file \(/.exec(ask)?.[1];
+	if (!selected) throw new Error(REPLAY_INLINE_ERROR);
+	const named = TAPES.filter((t) => t.match.test(instruction)).at(-1);
+	const fixAsk = named ? !named.again : FIX_ASK.test(instruction);
+	for (const tape of TAPES) {
+		if (tape.again || !fixAsk) continue;
+		for (const edit of tape.edits) {
+			const fixed = inlineFix(edit, selected);
+			if (fixed !== null) return fixed;
+		}
+	}
+	throw new Error(REPLAY_INLINE_ERROR);
+}
 function findTape(messages) {
-	const asks = messages.slice(2).filter((m) => m.role === "user" && typeof m.content === "string").map((m) => m.content).filter((text) => !text.startsWith(CONTINUATION_PREFIX)).reverse();
+	const asks = messages.slice(2).filter((m) => m.role === "user" && typeof m.content === "string").map((m) => m.content).filter((text) => !text.startsWith(CONTINUATION_PREFIX)).filter((text) => !isFailedFixAsk(text) && !/^build it\b/i.test(text)).reverse();
 	for (const text of asks) {
-		const tape = TAPES.find((t) => t.match.test(text));
-		if (tape) return tape;
+		const hits = TAPES.filter((t) => t.match.test(text));
+		if (hits.length > 0) return hits[hits.length - 1];
 	}
 	return null;
 }
@@ -157991,9 +158142,15 @@ function replayCompletion(messages, toolNames) {
 		}]);
 		return { content: tape.planText };
 	}
-	if (last?.role === "user" && String(last.content ?? "").startsWith(FIX_PROMPT_PREFIX)) {
-		const detail = String(last.content).split("\n").slice(1).map((l) => l.trim()).find(Boolean);
-		return { content: [`The edits are staged, but ${firstLine(String(last.content)).replace(/^Your edits do not pass/, "they do not pass").replace(/:$/, "")}${detail ? `: ${detail}` : "."}`, "This is a recorded replay, so it can't write a new fix. Review the diff, or switch to a real model."].join("\n") };
+	const askAt = [...messages].reverse().findIndex((m) => m.role === "user");
+	const askIndex = askAt < 0 ? -1 : messages.length - 1 - askAt;
+	const ask = askIndex >= 0 ? String(messages[askIndex]?.content ?? "") : "";
+	if (isFailedFixAsk(ask)) {
+		const edits = roundsOf(messages.slice(askIndex + 1)).filter((r) => r.names.includes("propose_edit"));
+		if (edits.length === 0 && tape.again?.length) return callsAt(rounds.length, tape.again.map(editCall));
+		if (edits.length > 0) return { content: "Still red, so this stops. The second try is staged beside the first, and nothing is applied." };
+		const detail = ask.split("\n").slice(1).map((l) => l.trim()).find(Boolean);
+		return { content: [`The edits are staged, but ${firstLine(ask).replace(/^Your edits do not pass/, "they do not pass").replace(/:$/, "")}${detail ? `: ${detail}` : "."}`, "This is a recorded replay, so it can't write a new fix. Review the diff, or switch to a real model."].join("\n") };
 	}
 	const editRounds = rounds.filter((r) => r.names.includes("propose_edit"));
 	const lastEdits = editRounds.at(-1);
@@ -158184,7 +158341,7 @@ function asAnthropicTools(tools) {
 }
 async function complete(cfg, messages, useTools, signal, tools = AGENT_TOOLS) {
 	if (cfg.provider === "replay") {
-		if (!useTools) throw new Error(REPLAY_INLINE_ERROR);
+		if (!useTools) return { content: replayInline(messages) };
 		return replayCompletion(messages, tools.map((t) => t.function.name));
 	}
 	if (cfg.provider === "anthropic") return completeAnthropic(cfg.apiKey, messages, useTools, signal, tools);
@@ -158830,6 +158987,8 @@ async function runTask(options, deps = {}) {
 			testScript: options.testScript,
 			timeoutMs: options.timeoutMs,
 			failOn: "red",
+			baseline: "recompute",
+			baselineDir: (0, node_path.join)(cwd, ".aperture", "check-baseline"),
 			testRunner: sandbox ? asTestRunner(sandbox) : void 0,
 			testsWhere: sandbox?.where
 		});

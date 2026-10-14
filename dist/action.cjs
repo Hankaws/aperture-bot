@@ -1,4 +1,4 @@
-const require_run = require("./run-CGmSA-lC.cjs");
+const require_run = require("./run-otqMf9qp.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_child_process = require("node:child_process");
@@ -1120,6 +1120,8 @@ async function runAction(env, deps = {}) {
 			testScript: input(env, "test-script") ?? "test",
 			timeoutMs: number(env, "timeout-minutes", 10) * 6e4,
 			failOn: "red",
+			baseline: "recompute",
+			baselineDir: (0, node_path.join)(cwd, ".aperture", "check-baseline"),
 			testRunner: sandbox ? require_run.asTestRunner(sandbox) : void 0,
 			testsWhere: sandbox?.where
 		});
