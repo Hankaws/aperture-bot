@@ -1,4 +1,4 @@
-const require_run = require("./run-otqMf9qp.cjs");
+const require_run = require("./run-3WApXkMO.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_child_process = require("node:child_process");
@@ -221,7 +221,6 @@ var GitHub = class {
 			baseRef: out.base.ref
 		};
 	}
-	/** The pull request's diff, as text. */
 	async diff(number) {
 		return this.call("GET", `${this.base}/pulls/${number}`, void 0, "application/vnd.github.diff");
 	}
@@ -248,7 +247,6 @@ var GitHub = class {
 	async defaultBranch() {
 		return (await this.call("GET", this.base)).default_branch ?? "main";
 	}
-	/** The commit a branch points at. */
 	async head(branch) {
 		return (await this.call("GET", `${this.base}/branches/${encodeURIComponent(branch)}`)).commit?.sha ?? "";
 	}

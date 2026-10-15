@@ -155005,6 +155005,417 @@ function normalizePlan(raw) {
 	return out;
 }
 //#endregion
+//#region src/lib/workspace/ts-service.ts
+const LIB_DIR = "/__lib__/";
+const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+/** Words a name cannot be: renaming to one would break the code. */
+const RESERVED = new Set("break case catch class const continue debugger default delete do else enum export extends false finally for function if import in instanceof new null return super switch this throw true try typeof var void while with as implements interface let package private protected public static yield await".split(" "));
+/** Why `next` cannot replace `name`, or null when it can. */
+function renameProblem(name, next) {
+	if (!next) return "Type a new name.";
+	if (next === name) return "That is the name it has.";
+	if (!IDENTIFIER.test(next)) return `"${next}" is not a name: use letters, digits, _ or $, not starting with a digit.`;
+	if (RESERVED.has(next)) return `"${next}" is a reserved word.`;
+	return null;
+}
+/**
+* The files a rename changes, with their new text. Null when a file no longer
+* holds the name where the rename found it (it was edited since), so a stale
+* rename never writes into the wrong place.
+*/
+function applyRename(files, name, locations, next) {
+	const byPath = /* @__PURE__ */ new Map();
+	for (const loc of locations) byPath.set(loc.path, [...byPath.get(loc.path) ?? [], loc]);
+	const out = {};
+	for (const [path, locs] of byPath) {
+		let text = files[path];
+		if (text === void 0) return null;
+		for (const loc of [...locs].sort((a, b) => b.start - a.start)) {
+			if (text.slice(loc.start, loc.start + loc.length) !== name) return null;
+			const replacement = `${loc.prefixText ?? ""}${next}${loc.suffixText ?? ""}`;
+			text = text.slice(0, loc.start) + replacement + text.slice(loc.start + loc.length);
+		}
+		out[path] = text;
+	}
+	return out;
+}
+/** Why the service cannot answer for this project, or null when it can. */
+function serviceUnavailable(files, limits = TSC_LIMITS) {
+	const roots = Object.keys(files).filter(isTsPath);
+	const bytes = roots.reduce((n, path) => n + (files[path]?.length ?? 0), 0);
+	if (roots.length > limits.files || bytes > limits.bytes) return `Project too large for the compiler ${limits.where ?? "in the browser"} (${roots.length} files).`;
+	return null;
+}
+/** Whether most of the project's relative imports name the file with its extension (`./store.ts`). */
+function importsKeepExtension(files) {
+	let withExt = 0;
+	let without = 0;
+	for (const [path, text] of Object.entries(files)) {
+		if (!isTsPath(path)) continue;
+		for (const match of text.matchAll(/\bfrom\s+["'](\.{1,2}\/[^"']+)["']/g)) if (/\.[cm]?[jt]sx?$/.test(match[1])) withExt++;
+		else without++;
+	}
+	return withExt > without;
+}
+function createTsService(ts) {
+	/** Every file the service can read, by compiler path, with a version that moves when its text does. */
+	const texts = /* @__PURE__ */ new Map();
+	let roots = [];
+	let options = {};
+	const put = (name, text) => {
+		const known = texts.get(name);
+		if (known?.text === text) return;
+		texts.set(name, {
+			text,
+			version: (known?.version ?? 0) + 1
+		});
+	};
+	const service = ts.createLanguageService({
+		getScriptFileNames: () => [...roots, SHIM_PATH],
+		getScriptVersion: (name) => String(texts.get(name)?.version ?? 0),
+		getScriptSnapshot: (name) => {
+			const known = texts.get(name);
+			return known ? ts.ScriptSnapshot.fromString(known.text) : void 0;
+		},
+		getCompilationSettings: () => options,
+		getCurrentDirectory: () => "/",
+		getDefaultLibFileName: (opts) => `${LIB_DIR}${ts.getDefaultLibFileName(opts)}`,
+		fileExists: (name) => texts.has(name),
+		readFile: (name) => texts.get(name)?.text,
+		directoryExists: () => true,
+		getDirectories: () => [],
+		useCaseSensitiveFileNames: () => true
+	}, ts.createDocumentRegistry(true, "/"));
+	const inProject = (name) => name !== "/__aperture__/ambient.d.ts" && !name.startsWith(LIB_DIR);
+	const format = {
+		...ts.getDefaultFormatCodeSettings("\n"),
+		indentSize: 2,
+		tabSize: 2,
+		convertTabsToSpaces: true
+	};
+	let preferences = {
+		quotePreference: "auto",
+		importModuleSpecifierPreference: "relative",
+		importModuleSpecifierEnding: "auto"
+	};
+	function fixesFor(name, start, end, code) {
+		let found;
+		try {
+			found = service.getCodeFixesAtPosition(name, start, end, [code], format, preferences);
+		} catch {
+			return [];
+		}
+		return found.filter((fix) => fix.changes.every((c) => !c.isNewFile && inProject(c.fileName) && c.fileName.startsWith("/"))).slice(0, 3).map((fix) => ({
+			description: fix.description,
+			changes: fix.changes.map((c) => ({
+				path: c.fileName.slice(1),
+				edits: c.textChanges.map((t) => ({
+					start: t.span.start,
+					length: t.span.length,
+					newText: t.newText
+				}))
+			}))
+		}));
+	}
+	return {
+		update(files, libs, next) {
+			options = next;
+			put(SHIM_PATH, SHIM);
+			for (const [name, text] of libs) put(`${LIB_DIR}${name}`, text);
+			const live = /* @__PURE__ */ new Set();
+			for (const [path, text] of Object.entries(files)) {
+				const name = `/${path}`;
+				live.add(name);
+				put(name, text);
+			}
+			for (const name of [...texts.keys()]) if (inProject(name) && !live.has(name)) texts.delete(name);
+			roots = Object.keys(files).filter(isTsPath).map((path) => `/${path}`);
+			preferences = {
+				...preferences,
+				importModuleSpecifierEnding: importsKeepExtension(files) ? "js" : "auto"
+			};
+		},
+		hover(path, offset) {
+			const info = service.getQuickInfoAtPosition(`/${path}`, offset);
+			if (!info) return null;
+			const signature = ts.displayPartsToString(info.displayParts);
+			if (!signature.trim()) return null;
+			const tags = (info.tags ?? []).map((tag) => {
+				const text = ts.displayPartsToString(tag.text).trim();
+				return `@${tag.name}${text ? ` ${text}` : ""}`;
+			});
+			return {
+				signature,
+				doc: [ts.displayPartsToString(info.documentation).trim(), ...tags].filter(Boolean).join("\n"),
+				start: info.textSpan.start,
+				length: info.textSpan.length
+			};
+		},
+		definition(path, offset) {
+			const found = service.getDefinitionAtPosition(`/${path}`, offset) ?? [];
+			const program = service.getProgram();
+			const targets = [];
+			for (const def of found) {
+				if (!inProject(def.fileName)) continue;
+				const file = program?.getSourceFile(def.fileName);
+				if (!file) continue;
+				const at = file.getLineAndCharacterOfPosition(def.textSpan.start);
+				const target = {
+					path: def.fileName.slice(1),
+					line: at.line + 1,
+					col: at.character,
+					length: def.textSpan.length
+				};
+				if (!targets.some((t) => t.path === target.path && t.line === target.line && t.col === target.col)) targets.push(target);
+			}
+			return {
+				targets,
+				elsewhere: targets.length === 0 && found.length > 0
+			};
+		},
+		completions(path, offset) {
+			const name = `/${path}`;
+			const text = texts.get(name)?.text ?? "";
+			const found = service.getCompletionsAtPosition(name, offset, {
+				includeCompletionsWithInsertText: false,
+				includeCompletionsForModuleExports: false
+			});
+			if (!found) return null;
+			const typed = /[\w$]*$/.exec(text.slice(0, offset))?.[0].toLowerCase() ?? "";
+			return {
+				entries: found.entries.filter((e) => !typed || e.name.toLowerCase().includes(typed)).sort((a, b) => a.sortText.localeCompare(b.sortText) || a.name.localeCompare(b.name)).slice(0, 200).map((e) => ({
+					name: e.name,
+					kind: e.kind,
+					sortText: e.sortText
+				})),
+				member: found.isMemberCompletion
+			};
+		},
+		problems(path) {
+			const name = `/${path}`;
+			if (!texts.has(name)) return [];
+			return [...service.getSyntacticDiagnostics(name), ...service.getSemanticDiagnostics(name)].filter((d) => d.start !== void 0 && d.category !== ts.DiagnosticCategory.Suggestion && d.category !== ts.DiagnosticCategory.Message).slice(0, 200).map((d, i) => ({
+				start: d.start,
+				length: Math.max(1, d.length ?? 1),
+				message: ts.flattenDiagnosticMessageText(d.messageText, "\n"),
+				severity: d.category === ts.DiagnosticCategory.Warning ? "warning" : "error",
+				code: `TS${d.code}`,
+				...(() => {
+					if (i >= 20) return {};
+					const fixes = fixesFor(name, d.start, d.start + (d.length ?? 0), d.code);
+					return fixes.length ? { fixes } : {};
+				})()
+			}));
+		},
+		references(path, offset) {
+			const name = `/${path}`;
+			const found = service.findReferences(name, offset);
+			if (!found?.length) return null;
+			const program = service.getProgram();
+			const declared = new Set((service.getDefinitionAtPosition(name, offset) ?? []).map((d) => `${d.fileName}:${d.textSpan.start}`));
+			const seen = /* @__PURE__ */ new Set();
+			const references = [];
+			for (const symbol of found) for (const ref of symbol.references) {
+				if (!inProject(ref.fileName)) continue;
+				const key = `${ref.fileName}:${ref.textSpan.start}`;
+				if (seen.has(key)) continue;
+				seen.add(key);
+				const file = program?.getSourceFile(ref.fileName);
+				if (!file) continue;
+				const at = file.getLineAndCharacterOfPosition(ref.textSpan.start);
+				const lineStart = file.getPositionOfLineAndCharacter(at.line, 0);
+				const lineEnd = file.getLineEndOfPosition(ref.textSpan.start);
+				references.push({
+					path: ref.fileName.slice(1),
+					start: ref.textSpan.start,
+					length: ref.textSpan.length,
+					line: at.line + 1,
+					col: at.character,
+					text: file.text.slice(lineStart, lineEnd).trim().slice(0, 160),
+					definition: declared.has(key)
+				});
+			}
+			references.sort((a, b) => a.path.localeCompare(b.path) || a.start - b.start);
+			const onName = references.some((r) => r.path === path && r.start <= offset && offset <= r.start + r.length);
+			const first = references[0];
+			if (!first || !onName) return null;
+			return {
+				name: (texts.get(`/${first.path}`)?.text ?? "").slice(first.start, first.start + first.length),
+				references
+			};
+		},
+		rename(path, offset) {
+			let name = `/${path}`;
+			let at = offset;
+			if (service.findRenameLocations(name, at, false, false, { providePrefixAndSuffixTextForRename: true })?.some((loc) => / as $/.test(loc.prefixText ?? "") || /^ as /.test(loc.suffixText ?? ""))) {
+				const def = service.getDefinitionAtPosition(name, at)?.find((d) => inProject(d.fileName));
+				if (def) {
+					name = def.fileName;
+					at = def.textSpan.start;
+				}
+			}
+			const info = service.getRenameInfo(name, at, { allowRenameOfImportPath: false });
+			if (!info.canRename) return {
+				ok: false,
+				reason: info.localizedErrorMessage
+			};
+			const found = service.findRenameLocations(name, at, false, false, { providePrefixAndSuffixTextForRename: true }) ?? [];
+			if (found.some((loc) => !inProject(loc.fileName))) return {
+				ok: false,
+				reason: `${info.displayName} is defined outside this project, in TypeScript's standard library or a package.`
+			};
+			const locations = found.map((loc) => ({
+				path: loc.fileName.slice(1),
+				start: loc.textSpan.start,
+				length: loc.textSpan.length,
+				...loc.prefixText ? { prefixText: loc.prefixText } : {},
+				...loc.suffixText ? { suffixText: loc.suffixText } : {}
+			}));
+			return {
+				ok: true,
+				name: info.displayName,
+				locations
+			};
+		}
+	};
+}
+//#endregion
+//#region src/lib/agent/code-intel.ts
+/** One service for a run: each call brings it up to date, and unchanged files keep their parse. */
+function codeIntel(host) {
+	const service = createTsService(host.ts);
+	return async (files) => {
+		const reason = serviceUnavailable(files, host.limits ?? TSC_LIMITS);
+		if (reason) return reason;
+		const options = compilerOptions(host.ts, files);
+		service.update(files, await host.libs(options), options);
+		return service;
+	};
+}
+const escape = (name) => name.replace(/[$]/g, "\\$&");
+/**
+* Where `name` could be asked about in `text`, best first: on `line` when
+* one is given, else its declarations, then every other whole-word match.
+* A match in a comment or string gets no answer, and the next one is tried.
+*/
+function nameOffsets(text, name, line) {
+	if (!/^[A-Za-z_$][\w$]*$/.test(name)) return [];
+	const word = new RegExp(`(?<![\\w$])${escape(name)}(?![\\w$])`, "g");
+	let all = [...text.matchAll(word)].map((m) => m.index);
+	if (line !== void 0 && Number.isFinite(line)) {
+		const starts = [0];
+		for (let i = 0; i < text.length; i++) if (text[i] === "\n") starts.push(i + 1);
+		const from = starts[line - 1];
+		const to = starts[line] ?? text.length + 1;
+		if (from !== void 0) {
+			const onLine = all.filter((at) => at >= from && at < to);
+			if (onLine.length) all = onLine;
+		}
+	}
+	const declared = new RegExp(`(?:function\\*?|class|const|let|var|type|interface|enum|namespace)\\s+${escape(name)}(?![\\w$])`, "g");
+	const decls = new Set([...text.matchAll(declared)].map((m) => m.index + m[0].length - name.length));
+	return [...all.filter((at) => decls.has(at)), ...all.filter((at) => !decls.has(at))].slice(0, 25);
+}
+function notTs(path) {
+	return `${path} is not a TypeScript file. These answers come from the TypeScript compiler; use grep for other files.`;
+}
+/** The references to `name` as asked from `path`, or null when the compiler knows no such name there. */
+function referencesTo(service, files, path, name, line) {
+	const text = files[path];
+	if (text === void 0) return null;
+	for (const at of nameOffsets(text, name, line)) {
+		const found = service.references(path, at);
+		if (found) return found.references;
+	}
+	return null;
+}
+/** `find_references`'s answer: every place, by file and line, the declaration marked. */
+function referencesAnswer(service, files, path, name, line) {
+	if (files[path] === void 0) return `File not found: ${path}`;
+	if (!isTsPath(path)) return notTs(path);
+	const refs = referencesTo(service, files, path, name, line);
+	if (!refs) return `TypeScript finds no name ${name} in ${path}. Check the spelling, or pass the line it is on.`;
+	const fileCount = new Set(refs.map((r) => r.path)).size;
+	const head = `${name}: ${refs.length} ${refs.length === 1 ? "place" : "places"} in ${fileCount} ${fileCount === 1 ? "file" : "files"}, from the TypeScript compiler (imports under another name count; comments and strings do not).`;
+	const byLine = /* @__PURE__ */ new Map();
+	for (const r of refs) {
+		const key = `${r.path}:${r.line}`;
+		if (!byLine.has(key) || r.definition) byLine.set(key, `${key}${r.definition ? " (declared)" : ""}: ${r.text}`);
+	}
+	const lines = [...byLine.values()];
+	const rows = lines.slice(0, 40);
+	const more = lines.length > 40 ? [`… and ${lines.length - 40} more lines`] : [];
+	return [
+		head,
+		...rows,
+		...more
+	].join("\n");
+}
+/** The files a rename of `name` (as asked from `path`) to `next` changes, with their new text. */
+function planRename(service, files, path, name, next, line) {
+	const text = files[path];
+	if (text === void 0) return {
+		ok: false,
+		reason: `File not found: ${path}`
+	};
+	if (!isTsPath(path)) return {
+		ok: false,
+		reason: notTs(path)
+	};
+	const problem = renameProblem(name, next);
+	if (problem) return {
+		ok: false,
+		reason: problem
+	};
+	let refused = "";
+	for (const at of nameOffsets(text, name, line)) {
+		const found = service.rename(path, at);
+		if (!found.ok) {
+			refused ||= found.reason;
+			continue;
+		}
+		if (found.name !== name) continue;
+		const changed = applyRename(files, name, found.locations, next);
+		if (!changed) return {
+			ok: false,
+			reason: `${name} moved while renaming. Try again.`
+		};
+		return {
+			ok: true,
+			name,
+			changed,
+			places: found.locations.length
+		};
+	}
+	return {
+		ok: false,
+		reason: refused ? `TypeScript cannot rename ${name}: ${refused}` : `TypeScript finds no name ${name} in ${path}. Check the spelling, or pass the line it is on.`
+	};
+}
+/** Files checked for a name that is gone: past that, the recap says nothing rather than hold the run up. */
+const MAX_GONE_FILES = 8;
+function usedElsewhere(service, files, path, name, skip) {
+	if (!isTsPath(path) || files[path] === void 0) return null;
+	const refs = referencesTo(service, files, path, name);
+	if (refs) {
+		const uses = refs.filter((r) => !skip.has(r.path) && !r.definition).map((r) => `${r.path}:${r.line}`);
+		return { uses: [...new Set(uses)] };
+	}
+	const word = new RegExp(`(?<![\\w$])${escape(name)}(?![\\w$])`);
+	const quoted = `'${name}'`;
+	const mentioning = Object.keys(files).filter((other) => !skip.has(other) && isTsPath(other) && word.test(files[other]));
+	if (mentioning.length > MAX_GONE_FILES) return null;
+	const broken = [];
+	for (const other of mentioning) {
+		const text = files[other];
+		for (const problem of service.problems(other)) {
+			if (problem.severity !== "error" || !problem.message.includes(quoted)) continue;
+			broken.push(`${other}:${text.slice(0, problem.start).split("\n").length}`);
+		}
+	}
+	return { broken: [...new Set(broken)] };
+}
+//#endregion
 //#region src/lib/agent/tools.ts
 const AGENT_TOOLS = [
 	{
@@ -155101,6 +155512,69 @@ const AGENT_TOOLS = [
 			parameters: {
 				type: "object",
 				properties: { prefix: { type: "string" } }
+			}
+		}
+	},
+	{
+		type: "function",
+		function: {
+			name: "find_references",
+			description: "Every place a TypeScript name (function, type, variable, export) is declared or used, from the TypeScript compiler: it follows imports under another name and skips comments, strings and unrelated names spelled the same, which grep cannot. Use it before changing what a name takes or returns.",
+			parameters: {
+				type: "object",
+				properties: {
+					path: {
+						type: "string",
+						description: "A file where the name appears."
+					},
+					name: {
+						type: "string",
+						description: "The name, e.g. listTasks."
+					},
+					line: {
+						type: "number",
+						description: "Optional 1-based line, when the file has more than one thing by that name."
+					}
+				},
+				required: ["path", "name"]
+			}
+		}
+	},
+	{
+		type: "function",
+		function: {
+			name: "rename_symbol",
+			description: "Rename a TypeScript name everywhere it is used, as the editor's F2 does, and stage one edit per file it changes. Safer than editing each use by hand: imports, re-exports and shorthand properties stay right. Comments and strings keep the old name. Same locks and confidence rule as propose_edit.",
+			parameters: {
+				type: "object",
+				properties: {
+					path: {
+						type: "string",
+						description: "A file where the name appears."
+					},
+					name: {
+						type: "string",
+						description: "The current name."
+					},
+					newName: {
+						type: "string",
+						description: "The new name."
+					},
+					line: {
+						type: "number",
+						description: "Optional 1-based line, when the file has more than one thing by that name."
+					},
+					confidence: {
+						type: "number",
+						description: "0 to 1. How sure this rename is right. Below 0.8 it is dropped."
+					}
+				},
+				required: [
+					"path",
+					"name",
+					"newName",
+					"confidence"
+				]
 			}
 		}
 	},
@@ -155214,8 +155688,8 @@ const AGENT_TOOLS = [
 	}
 ];
 function toolsForStep(kind) {
-	if (kind === "read") return AGENT_TOOLS.filter((t) => t.function.name !== "propose_edit" && t.function.name !== "set_plan" && t.function.name !== "note_diff" && t.function.name !== "run_script" && t.function.name !== "mcp_call");
-	if (kind === "plan") return AGENT_TOOLS.filter((t) => t.function.name !== "propose_edit" && t.function.name !== "note_diff");
+	if (kind === "read") return AGENT_TOOLS.filter((t) => t.function.name !== "propose_edit" && t.function.name !== "rename_symbol" && t.function.name !== "set_plan" && t.function.name !== "note_diff" && t.function.name !== "run_script" && t.function.name !== "mcp_call");
+	if (kind === "plan") return AGENT_TOOLS.filter((t) => t.function.name !== "propose_edit" && t.function.name !== "rename_symbol" && t.function.name !== "note_diff");
 	if (kind === "review") return AGENT_TOOLS.filter((t) => t.function.name === "note_diff");
 	return AGENT_TOOLS.filter((t) => t.function.name !== "note_diff");
 }
@@ -155244,6 +155718,18 @@ function similarPaths(path, keys) {
 	const base = path.split("/").pop()?.toLowerCase() ?? path.toLowerCase();
 	if (!base) return [];
 	return keys.filter((key) => key.toLowerCase() === path.toLowerCase() || key.toLowerCase().endsWith(`/${base}`) || key.toLowerCase().includes(base)).slice(0, 8);
+}
+/** Why this turn may not stage an edit, or null when it may. */
+function editLock(ctx) {
+	if (ctx.mode === "chat") return "Ask mode does not edit. The user can switch to Agent.";
+	if (ctx.role === "review") return "Review mode: call note_diff with bug and confidence. Do not propose_edit.";
+	if (ctx.phase === "plan") return "Edits are locked until the user clicks Build it.";
+	if (ctx.requirePlan && ctx.plan.length === 0 && ctx.phase !== "skip") return "Edits are locked until you call set_plan with 3–7 steps.";
+	return null;
+}
+function lineArg(value) {
+	const line = Number(value);
+	return Number.isInteger(line) && line > 0 ? line : void 0;
 }
 async function executeTool(name, args, ctx) {
 	if (name === "set_plan") {
@@ -155285,11 +155771,44 @@ async function executeTool(name, args, ctx) {
 		const prefix = String(args.prefix ?? "");
 		return Object.keys(ctx.files).filter((p) => prefix ? p === prefix || p.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`) : true).sort().map((p) => `${p}  (${ctx.files[p].split("\n").length} lines)`).join("\n") || "(empty)";
 	}
+	if (name === "find_references") {
+		const path = safeRelPath(String(args.path ?? "")) ?? "";
+		const symbol = String(args.name ?? "").trim();
+		if (!path || !symbol) return "find_references needs path and name.";
+		const intel = ctx.intel ? await ctx.intel() : "TypeScript is not available here.";
+		if (typeof intel === "string") return `${intel} Use grep instead.`;
+		return referencesAnswer(intel.service, intel.files, path, symbol, lineArg(args.line));
+	}
+	if (name === "rename_symbol") {
+		const locked = editLock(ctx);
+		if (locked) return locked;
+		if (!keepEdit(parseConfidence(args.confidence))) return "Edit dropped. Confidence is below 0.8, so nothing was staged.";
+		const path = safeRelPath(String(args.path ?? "")) ?? "";
+		const symbol = String(args.name ?? "").trim();
+		const next = String(args.newName ?? "").trim();
+		if (!path || !symbol) return "rename_symbol needs path, name and newName.";
+		const intel = ctx.intel ? await ctx.intel() : "TypeScript is not available here.";
+		if (typeof intel === "string") return `${intel} Rename with propose_edit in each file instead.`;
+		const plan = planRename(intel.service, intel.files, path, symbol, next, lineArg(args.line));
+		if (!plan.ok) return `Rename not staged: ${plan.reason}`;
+		const paths = Object.keys(plan.changed).sort();
+		for (const changed of paths) {
+			const newText = plan.changed[changed];
+			ctx.edits.push({
+				id: `edit_${ctx.edits.length + 1}_${changed}`,
+				path: changed,
+				oldText: intel.files[changed],
+				newText,
+				description: `Rename ${symbol} to ${next}`,
+				status: "pending"
+			});
+			ctx.files[changed] = newText;
+		}
+		return `Edit staged for ${paths.length === 1 ? "1 file" : `${paths.length} files`}: ${symbol} renamed to ${next} in ${plan.places} ${plan.places === 1 ? "place" : "places"} (${paths.slice(0, 6).join(", ")}${paths.length > 6 ? ", …" : ""}). Comments and strings keep the old name; grep for it if they should change too.`;
+	}
 	if (name === "propose_edit") {
-		if (ctx.mode === "chat") return "Ask mode does not edit. The user can switch to Agent.";
-		if (ctx.role === "review") return "Review mode: call note_diff with bug and confidence. Do not propose_edit.";
-		if (ctx.phase === "plan") return "Edits are locked until the user clicks Build it.";
-		if (ctx.requirePlan && ctx.plan.length === 0 && ctx.phase !== "skip") return "Edits are locked until you call set_plan with 3–7 steps.";
+		const locked = editLock(ctx);
+		if (locked) return locked;
 		if (!keepEdit(parseConfidence(args.confidence))) return "Edit dropped. Confidence is below 0.8, so nothing was staged.";
 		const path = safeRelPath(String(args.path ?? "")) ?? "";
 		const search = String(args.search ?? "");
@@ -156937,13 +157456,25 @@ function filesMentioning(files, symbol, skip) {
 	}
 	return out;
 }
+/** `file:line` places, by file: "a.ts (lines 2, 8), b.ts:3 and 2 more files". */
+function byFile(at) {
+	const lines = /* @__PURE__ */ new Map();
+	for (const place of at) {
+		const cut = place.lastIndexOf(":");
+		const file = place.slice(0, cut);
+		lines.set(file, [...lines.get(file) ?? [], place.slice(cut + 1)]);
+	}
+	const files = [...lines].map(([file, rows]) => rows.length === 1 ? `${file}:${rows[0]}` : `${file} (lines ${rows.slice(0, 3).join(", ")}${rows.length > 3 ? ", …" : ""})`);
+	const more = files.length - 2;
+	return `${files.slice(0, 2).join(", ")}${more > 0 ? ` and ${more} more ${more === 1 ? "file" : "files"}` : ""}`;
+}
 /**
 * Recap: what changed, what code still references it, what the plan left open.
 * The last line only appears once some step has moved off "pending": a plan
 * nobody updated says nothing about what is left, and listing all of it would
 * claim the work just done was not.
 */
-function verifyRecap(edits, files, plan = [], parse) {
+function verifyRecap(edits, files, plan = [], parse, usedIn) {
 	if (edits.length === 0) return "";
 	const paths = [...new Set(edits.map((e) => e.path))];
 	const skip = new Set(paths);
@@ -156952,11 +157483,22 @@ function verifyRecap(edits, files, plan = [], parse) {
 		return names.length ? `${path} (${names.slice(0, 3).join(", ")})` : path;
 	}).slice(0, 4).join("; ")}`;
 	const leftover = [];
-	for (const symbol of [...new Set(edits.flatMap(symbolsFromEdit))].slice(0, 5)) {
+	const seen = /* @__PURE__ */ new Set();
+	let exact = true;
+	for (const edit of edits) for (const symbol of symbolsFromEdit(edit)) {
+		if (seen.has(symbol) || seen.size >= 5) continue;
+		seen.add(symbol);
+		const found = usedIn?.(edit.path, symbol, skip) ?? null;
+		if (found) {
+			if ("uses" in found && found.uses.length) leftover.push(`${symbol} is used in ${byFile(found.uses)}`);
+			if ("broken" in found && found.broken.length) leftover.push(`${symbol} is gone but still used in ${byFile(found.broken)}`);
+			continue;
+		}
+		exact = false;
 		const hits = filesMentioning(files, symbol, skip);
 		if (hits.length) leftover.push(`${symbol} also appears in ${hits.slice(0, 2).join(", ")}`);
 	}
-	const line2 = leftover.length ? `Elsewhere: ${leftover.slice(0, 2).join("; ")}` : "Elsewhere: no other file mentions the changed names.";
+	const line2 = leftover.length ? `Elsewhere: ${leftover.slice(0, 2).join("; ")}` : exact && seen.size > 0 ? "Elsewhere: no other file uses the changed names." : "Elsewhere: no other file mentions the changed names.";
 	const tracked = plan.some((e) => e.status !== "pending");
 	const open = plan.filter((e) => e.status !== "completed").map((e) => e.content);
 	const line3 = !tracked ? "" : open.length ? `Left: ${open.slice(0, 2).join("; ")}` : "Left: nothing on the plan.";
@@ -156968,9 +157510,9 @@ function verifyRecap(edits, files, plan = [], parse) {
 		preview.length ? `Preview: ${preview.map((row) => `${row.path} ${row.issues[0]}`).slice(0, 2).join("; ")}` : ""
 	].filter(Boolean).join("\n");
 }
-function appendVerify(text, edits, files, plan = [], parse) {
+function appendVerify(text, edits, files, plan = [], parse, usedIn) {
 	if (edits.length === 0 || text.includes("Changed:")) return text;
-	const recap = verifyRecap(edits, files, plan, parse);
+	const recap = verifyRecap(edits, files, plan, parse, usedIn);
 	if (!recap) return text;
 	return `${text.trim()}\n\n${recap}`;
 }
@@ -157312,6 +157854,41 @@ async function runLoop(input, cfg, emit, signal, host) {
 		kept: 0,
 		dropped: 0
 	};
+	const sent = { ...files };
+	const project = () => {
+		const view = { ...fileMap };
+		for (const [path, text] of Object.entries(ctx.files)) if (text !== sent[path]) view[path] = text;
+		return view;
+	};
+	let intelLoad;
+	const intel = host.language && !reviewing ? async () => {
+		intelLoad ??= host.language().then(codeIntel, () => null);
+		const ask = await intelLoad;
+		if (!ask) return "TypeScript could not load here.";
+		const view = project();
+		try {
+			const service = await ask(view);
+			return typeof service === "string" ? service : {
+				service,
+				files: view
+			};
+		} catch {
+			return "TypeScript could not read this project.";
+		}
+	} : void 0;
+	/** The compiler's answer to "where else is this used", for the recap, when an edit touched TypeScript. */
+	const recapUses = async (edits) => {
+		if (!intel || !edits.some((e) => isTsPath(e.path))) return void 0;
+		const found = await intel();
+		if (typeof found === "string") return void 0;
+		return (path, symbol, skip) => {
+			try {
+				return usedElsewhere(found.service, found.files, path, symbol, skip);
+			} catch {
+				return null;
+			}
+		};
+	};
 	const ctx = {
 		files,
 		chunks,
@@ -157323,6 +157900,7 @@ async function runLoop(input, cfg, emit, signal, host) {
 		requirePlan,
 		newFiles: input.newFiles,
 		loadParse: host.parser,
+		intel,
 		phase,
 		mode: input.mode,
 		role: input.role,
@@ -157441,16 +158019,18 @@ async function runLoop(input, cfg, emit, signal, host) {
 	let checkedInTurn = false;
 	const maxSteps = reviewing ? 1 : phase === "build" ? MAX_BUILD_STEPS : MAX_PLAN_STEPS;
 	const userBlob = `${userCtx}\n\n${input.instruction}`;
-	const succeed = (body, steps) => {
+	const succeed = async (body, steps) => {
 		const edits = body.edits;
 		const changed = edits.some((e) => !(input.pendingEdits ?? []).some((p) => p.id === e.id && p.newText === e.newText));
-		const text = body.awaitingBuild || phase === "plan" || !changed ? body.text : appendVerify(body.text, edits, ctx.files, body.plan ?? ctx.plan, ctx.parse);
-		const line = verify?.script && verify.status === "passed" ? verifiedLine(verify.script) : verify?.script && verify.status === "failed" ? failedLine(verify.script) : "";
-		const verifiedText = line ? `${text}\n\n${line}` : text;
-		if (text !== body.text) emit({
+		const recap = !body.awaitingBuild && phase !== "plan" && changed;
+		if (recap) emit({
 			type: "status",
 			text: "Verifying…"
 		});
+		const usedIn = recap ? await recapUses(edits).catch(() => void 0) : void 0;
+		const text = recap ? appendVerify(body.text, edits, ctx.files, body.plan ?? ctx.plan, ctx.parse, usedIn) : body.text;
+		const line = verify?.script && verify.status === "passed" ? verifiedLine(verify.script) : verify?.script && verify.status === "failed" ? failedLine(verify.script) : "";
+		const verifiedText = line ? `${text}\n\n${line}` : text;
 		const debug = packDebug(input, cfg.provider, sys, userBlob, verifiedText, steps);
 		const extra = {
 			...debug ? { debug } : {},
@@ -157492,7 +158072,7 @@ async function runLoop(input, cfg, emit, signal, host) {
 			const calls = completion.tool_calls ?? [];
 			const callNames = calls.map((c) => c.function.name);
 			if (calls.length === 0) {
-				if (reviewing) return succeed({
+				if (reviewing) return await succeed({
 					text: withReviewLine(completion.content ?? "", reviewTally.kept, reviewTally.dropped),
 					traces,
 					edits: mergeEdits(ctx.edits),
@@ -157510,7 +158090,7 @@ async function runLoop(input, cfg, emit, signal, host) {
 					});
 					continue;
 				}
-				if (shouldAwaitBuild(phase, hasPlan, [])) return succeed({
+				if (shouldAwaitBuild(phase, hasPlan, [])) return await succeed({
 					text: planReadyText(completion.content),
 					traces,
 					edits: [],
@@ -157520,7 +158100,7 @@ async function runLoop(input, cfg, emit, signal, host) {
 				const staged = mergeEdits(ctx.edits);
 				const verifyScript = chooseVerifyScript(ctx.files);
 				const editsKey = JSON.stringify(staged.map((e) => [e.path, e.newText]));
-				if (browserRun) return succeed({
+				if (browserRun) return await succeed({
 					text: completion.content.trim() || "Done.",
 					traces,
 					edits: staged,
@@ -157559,7 +158139,7 @@ async function runLoop(input, cfg, emit, signal, host) {
 						continue;
 					}
 				}
-				return succeed({
+				return await succeed({
 					text: completion.content.trim() || "Done.",
 					traces,
 					edits: staged,
@@ -157620,11 +158200,12 @@ async function runLoop(input, cfg, emit, signal, host) {
 						type: "plan",
 						entries: ctx.plan
 					});
-					if (outcome.call.name === "propose_edit" || outcome.call.name === "note_diff") emit({
+					const edited = outcome.call.name === "propose_edit" || outcome.call.name === "rename_symbol";
+					if (edited || outcome.call.name === "note_diff") emit({
 						type: "edits",
 						edits: mergeEdits(ctx.edits)
 					});
-					if (outcome.call.name === "propose_edit") editResults.push(outcome.result);
+					if (edited) editResults.push(outcome.result);
 					messages.push({
 						role: "tool",
 						tool_call_id: outcome.call.id,
@@ -157632,7 +158213,7 @@ async function runLoop(input, cfg, emit, signal, host) {
 					});
 				}
 			}
-			if (reviewing) return succeed({
+			if (reviewing) return await succeed({
 				text: withReviewLine(completion.content ?? "", reviewTally.kept, reviewTally.dropped),
 				traces,
 				edits: mergeEdits(ctx.edits),
@@ -157657,7 +158238,7 @@ async function runLoop(input, cfg, emit, signal, host) {
 							continue;
 						}
 					}
-					return succeed({
+					return await succeed({
 						text: stop === "stop" ? "Not staged. Confidence was below 0.8." : completion.content.trim() || "Staged.",
 						traces,
 						edits: staged,
@@ -157669,14 +158250,14 @@ async function runLoop(input, cfg, emit, signal, host) {
 			else if (callNames.includes("run_script")) scriptsWithoutEdits += callNames.filter((name) => name === "run_script").length;
 			if (browserRun || scriptsWithoutEdits >= 2) {
 				const staged = mergeEdits(ctx.edits);
-				return succeed({
+				return await succeed({
 					text: browserRun ? staged.length > 0 ? "Staged. Tests run in your browser next." : "No edit yet. Tests run in your browser on the current files; stage the fix after the result." : "Stopped. Stage the change with propose_edit before running the tests again.",
 					traces,
 					edits: staged,
 					plan: ctx.plan
 				}, step + 1);
 			}
-			if (shouldAwaitBuild(phase, ctx.plan.length > 0, callNames)) return succeed({
+			if (shouldAwaitBuild(phase, ctx.plan.length > 0, callNames)) return await succeed({
 				text: planReadyText(completion.content),
 				traces,
 				edits: [],
@@ -157687,7 +158268,7 @@ async function runLoop(input, cfg, emit, signal, host) {
 		const staged = mergeEdits(ctx.edits);
 		const text = phase === "plan" && ctx.plan.length > 0 ? planReadyText(void 0) : staged.length > 0 ? "Stopped after the tool-call limit. Review the staged edits." : "Stopped after the tool-call limit. Nothing was staged.";
 		const awaitingBuild = phase === "plan" && ctx.plan.length > 0;
-		return succeed({
+		return await succeed({
 			text,
 			traces,
 			edits: awaitingBuild ? [] : staged,
@@ -158577,6 +159158,16 @@ function runnerHost(model, budget, runScript) {
 		parser: async () => {
 			const mod = await Promise.resolve().then(() => /* @__PURE__ */ require_rolldown_runtime.__toESM(require_typescript(), 1));
 			return tsParseCheck(mod.default ?? mod);
+		},
+		language: async () => {
+			const mod = await Promise.resolve().then(() => /* @__PURE__ */ require_rolldown_runtime.__toESM(require_typescript(), 1));
+			const ts = mod.default ?? mod;
+			const readLib = libReader();
+			return {
+				ts,
+				libs: async (options) => libFilesFor(ts, options, readLib),
+				limits: RUNNER_TSC_LIMITS
+			};
 		}
 	};
 }
