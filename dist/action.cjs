@@ -1,4 +1,4 @@
-const require_run = require("./run-CE8bH8RG.cjs");
+const require_run = require("./run-CHBrIuFH.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_child_process = require("node:child_process");
@@ -564,6 +564,7 @@ function fetchBase(cwd, ref) {
 function commitFiles(cwd, paths, message, author = BOT_AUTHOR) {
 	require_run.git([
 		"add",
+		"-A",
 		"--",
 		...paths
 	], cwd);
@@ -589,11 +590,12 @@ function push(cwd, branch) {
 /** The change to `paths` as a diff, new files included, for a reply on the thread. */
 function diffOf(cwd, paths, max = 3e4) {
 	if (paths.length === 0) return "";
-	require_run.git([
+	const present = paths.filter((path) => (0, node_fs.existsSync)((0, node_path.join)(cwd, path)));
+	if (present.length) require_run.git([
 		"add",
 		"--intent-to-add",
 		"--",
-		...paths
+		...present
 	], cwd);
 	const diff = require_run.git([
 		"diff",
