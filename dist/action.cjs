@@ -84,16 +84,16 @@ const CONTEXT_LIMITS = {
 	total: 12e3,
 	diff: 2e4
 };
-const clip$2 = (text, max) => text.length <= max ? text : `${text.slice(0, max)}\n… (cut at ${max} characters)`;
+const clip$3 = (text, max) => text.length <= max ? text : `${text.slice(0, max)}\n… (cut at ${max} characters)`;
 function threadContext(command, comments, diff) {
-	const parts = [`${command.isPull ? "Pull request" : "Issue"} #${command.number}: ${command.title}`, clip$2(command.body.trim(), 4e3)];
-	const shown = comments.filter((c) => c.authorType !== "Bot" && c.id !== command.commentId).slice(-CONTEXT_LIMITS.comments);
+	const parts = [`${command.isPull ? "Pull request" : "Issue"} #${command.number}: ${command.title}`, clip$3(command.body.trim(), 4e3)];
+	const shown = comments.filter((c) => (c.authorType !== "Bot" || c.id === command.follows) && c.id !== command.commentId).slice(-CONTEXT_LIMITS.comments);
 	if (shown.length > 0) {
 		parts.push("Comments, oldest first:");
-		for (const c of shown) parts.push(`@${c.author}: ${clip$2(c.body.trim(), CONTEXT_LIMITS.commentChars)}`);
+		for (const c of shown) parts.push(c.id === command.follows ? `Aperture Bot (the reply this follows): ${clip$3(c.body.replace(/<!-- aperture-bot [\s\S]*?-->/g, "").trim(), CONTEXT_LIMITS.commentChars)}` : `@${c.author}: ${clip$3(c.body.trim(), CONTEXT_LIMITS.commentChars)}`);
 	}
-	let text = clip$2(parts.filter(Boolean).join("\n\n"), CONTEXT_LIMITS.total);
-	if (diff) text += `\n\nThe pull request's diff:\n${clip$2(diff, CONTEXT_LIMITS.diff)}`;
+	let text = clip$3(parts.filter(Boolean).join("\n\n"), CONTEXT_LIMITS.total);
+	if (diff) text += `\n\nThe pull request's diff:\n${clip$3(diff, CONTEXT_LIMITS.diff)}`;
 	return text;
 }
 //#endregion
@@ -196,22 +196,22 @@ const LIMITS = {
 	error: 1e3,
 	next: 5
 };
-const clip$1 = (text, max) => text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+const clip$2 = (text, max) => text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 /** The summary kept to a size a comment can always carry. */
 function bounded(summary) {
 	return {
 		...summary,
-		plan: summary.plan?.slice(0, LIMITS.plan).map((step) => clip$1(step, LIMITS.text)),
+		plan: summary.plan?.slice(0, LIMITS.plan).map((step) => clip$2(step, LIMITS.text)),
 		checks: summary.checks?.slice(0, LIMITS.checks).map((row) => ({
 			status: row.status,
-			label: clip$1(row.label, LIMITS.text),
-			detail: clip$1(row.detail, LIMITS.text)
+			label: clip$2(row.label, LIMITS.text),
+			detail: clip$2(row.detail, LIMITS.text)
 		})),
 		files: summary.files?.slice(0, LIMITS.files),
-		next: summary.next?.slice(0, LIMITS.next).map((task) => clip$1(task, LIMITS.text)),
-		task: summary.task === void 0 ? void 0 : clip$1(summary.task, LIMITS.error),
-		error: summary.error === void 0 ? void 0 : clip$1(summary.error, LIMITS.error),
-		note: summary.note === void 0 ? void 0 : clip$1(summary.note, LIMITS.error)
+		next: summary.next?.slice(0, LIMITS.next).map((task) => clip$2(task, LIMITS.text)),
+		task: summary.task === void 0 ? void 0 : clip$2(summary.task, LIMITS.error),
+		error: summary.error === void 0 ? void 0 : clip$2(summary.error, LIMITS.error),
+		note: summary.note === void 0 ? void 0 : clip$2(summary.note, LIMITS.error)
 	};
 }
 /**
@@ -270,7 +270,7 @@ function readSummary(body) {
 	if (typeof r.rounds === "number") out.rounds = r.rounds;
 	out.plan = strings(r.plan);
 	out.files = strings(r.files);
-	const next = strings(r.next)?.slice(0, LIMITS.next).map((task) => clip$1(task, LIMITS.text));
+	const next = strings(r.next)?.slice(0, LIMITS.next).map((task) => clip$2(task, LIMITS.text));
 	if (next?.length) out.next = next;
 	if (typeof r.sig === "string" && /^[0-9a-f]{32}$/.test(r.sig)) out.sig = r.sig;
 	if (Array.isArray(r.checks)) out.checks = r.checks.flatMap((row) => {
@@ -289,7 +289,7 @@ function readSummary(body) {
 	if (typeof r.tests === "string" || r.tests === null) out.tests = r.tests;
 	if (typeof r.usage === "string") out.usage = r.usage;
 	if (typeof r.error === "string") out.error = r.error;
-	if (typeof r.note === "string" && r.note.trim()) out.note = clip$1(r.note, LIMITS.error);
+	if (typeof r.note === "string" && r.note.trim()) out.note = clip$2(r.note, LIMITS.error);
 	return out;
 }
 function isGithubUrl(value) {
@@ -313,6 +313,11 @@ const PHASE_TEXT = {
 /** The phase as a line, with the round when there is one. */
 function phaseLine(summary) {
 	return `${PHASE_TEXT[summary.phase ?? "starting"]}${(summary.phase === "checking" || summary.phase === "fixing") && summary.round ? ` (round ${summary.round}${summary.rounds ? ` of ${summary.rounds}` : ""})` : ""}.`;
+}
+/** The diff a reply shows in its "The change I did not push" block, if it has one. */
+function unpushedDiff(body) {
+	const match = /<summary>The change I did not push<\/summary>\s*```diff\n([\s\S]*?)\n```/.exec(body);
+	return match ? match[1] : null;
 }
 //#endregion
 //#region packages/aperture-bot/src/event.ts
@@ -353,14 +358,14 @@ function taskFrom(body, trigger = DEFAULT_TRIGGER) {
 * `/aperture check`: the first line is the word alone, so "check the login
 * flow" stays a task, and a signature or footer under it changes nothing.
 */
-function isCheck(task) {
+function isCheck$1(task) {
 	return /^check[.!]?$/i.test(task.trim().split("\n")[0].trim());
 }
 /** `/aperture review`: the word alone on the first line, as with `check`. */
 function isReview(task) {
 	return /^review[.!]?$/i.test(task.trim().split("\n")[0].trim());
 }
-function parseEvent(name, payload, trigger = DEFAULT_TRIGGER, label = DEFAULT_LABEL) {
+function parseEvent(name, payload, trigger = DEFAULT_TRIGGER, label = DEFAULT_LABEL, follow = false) {
 	if (name === "schedule" || name === "workflow_dispatch") return { scheduled: true };
 	if (name === "issues") return payload?.action === "opened" ? opened(payload) : labelled(payload, label);
 	if (name === "pull_request") return pushed(payload);
@@ -372,12 +377,27 @@ function parseEvent(name, payload, trigger = DEFAULT_TRIGGER, label = DEFAULT_LA
 	const user = event.comment?.user;
 	if (user?.type === "Bot") return { ignored: "comments from bots are not commands." };
 	const task = taskFrom(event.comment?.body ?? "", trigger);
-	if (task === null) return { ignored: `the comment does not start with ${trigger}.` };
 	const issue = event.issue;
 	const repo = event.repository;
+	if (task === null) {
+		if (!follow) return { ignored: `the comment does not start with ${trigger}.` };
+		if (!issue?.number || !event.comment?.id || !user?.login || !repo?.name || !repo.owner?.login) return { ignored: "the event is missing the issue, comment or repository." };
+		return { follow: {
+			number: issue.number,
+			isPull: Boolean(issue.pull_request),
+			title: issue.title ?? "",
+			body: issue.body ?? "",
+			text: event.comment.body ?? "",
+			commentId: event.comment.id,
+			author: user.login,
+			owner: repo.owner.login,
+			repo: repo.name,
+			defaultBranch: repo.default_branch ?? "main"
+		} };
+	}
 	if (!issue?.number || !event.comment?.id || !user?.login || !repo?.name || !repo.owner?.login) return { ignored: "the event is missing the issue, comment or repository." };
 	const title = issue.title ?? "";
-	const check = isCheck(task);
+	const check = isCheck$1(task);
 	const review = !check && isReview(task);
 	const asked = !check && !review && isQuestion(task);
 	return { command: {
@@ -538,6 +558,56 @@ function labelled(payload, label) {
 		repo: repo.name,
 		defaultBranch: repo.default_branch ?? "main"
 	} };
+}
+//#endregion
+//#region packages/aperture-bot/src/follow.ts
+const THANKS = /^(thanks|thank you|thx|ty|great|nice|perfect|cool|awesome|ok,? thanks|lgtm|👍|🎉|🙏|❤️)[\s!.]*$/iu;
+const YES = /^(yes|yep|yeah|yup|ok|okay|sure|go ahead|do it|please do|ship it|sounds good)(,?\s*please)?[\s!.]*$/i;
+const ORDINALS = {
+	first: 0,
+	"1st": 0,
+	second: 1,
+	"2nd": 1,
+	third: 2,
+	"3rd": 2,
+	fourth: 3,
+	"4th": 3,
+	fifth: 4,
+	"5th": 4
+};
+const NTH = /^(?:yes,?\s*)?(?:please\s+)?(?:do|go with|start|pick)\s+(?:the\s+)?(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th|#?[1-5])(?:\s+one)?(?:,?\s*please)?[\s!.]*$/i;
+/** What a follow-up comment asks: to do one of the reply's suggestions, nothing, or an answer. */
+function followKind(text) {
+	const line = text.trim();
+	if (!line) return { kind: "thanks" };
+	if (THANKS.test(line)) return { kind: "thanks" };
+	if (YES.test(line)) return {
+		kind: "do",
+		index: 0
+	};
+	const nth = NTH.exec(line);
+	if (nth) {
+		const word = nth[1].toLowerCase().replace(/^#/, "");
+		return {
+			kind: "do",
+			index: ORDINALS[word] ?? Number(word) - 1
+		};
+	}
+	return { kind: "ask" };
+}
+/** True when the comment @mentions someone: it is addressed to them, not the bot. */
+function mentionsSomeone(text) {
+	return /(^|[^\w@`/.])@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\b/.test(text);
+}
+/**
+* Who the bot's reply answered, who alone it follows: the asking comment's
+* author, or whoever added the label, pushed or ticked. Null when nobody
+* asked (the brief, a new issue, a red run): any writer may follow those.
+*/
+function askerOf(summary, comments) {
+	if (summary.asked > 0) return comments.find((c) => c.id === summary.asked)?.author ?? null;
+	if (summary.via === "label" || summary.via === "pull" || summary.via === "tick") return summary.by ?? null;
+	return null;
 }
 //#endregion
 //#region packages/aperture-bot/src/github.ts
@@ -729,6 +799,25 @@ var GitHub = class {
 			body: c.body ?? ""
 		}));
 	}
+	/**
+	* Comments updated since then, as GitHub gives them, newest first: the
+	* week's digest reads them as tasks (`week.ts`).
+	*/
+	async rawCommentsSince(since) {
+		return this.all(`${this.base}/issues/comments?since=${encodeURIComponent(since)}&sort=updated&direction=desc`);
+	}
+	/** Issues and pull requests updated since then, and whether each pull request was merged. */
+	async threadsSince(since) {
+		const rows = await this.all(`${this.base}/issues?state=all&since=${encodeURIComponent(since)}`);
+		const threads = /* @__PURE__ */ new Map();
+		for (const r of rows) if (typeof r.number === "number") threads.set(r.number, {
+			title: r.title ?? "",
+			isPull: Boolean(r.pull_request),
+			open: r.state !== "closed",
+			...r.pull_request?.merged_at ? { merged: true } : {}
+		});
+		return threads;
+	}
 	/** Open pull requests: their branch and page, and what the look-over reads. */
 	async openPulls() {
 		return (await this.all(`${this.base}/pulls?state=open`)).map((p) => ({
@@ -905,14 +994,14 @@ function placeNotes(files, notes) {
 		unplaced
 	};
 }
-const clip = (text, max) => {
+const clip$1 = (text, max) => {
 	const flat = text.replace(/\s+/g, " ").trim();
 	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 };
 /** The fix for a note, as a box to tick: where, and what is wrong. */
 function fixTask(note) {
 	const where = note.line ? `${note.path}:${note.line}` : note.path;
-	return clip(`Fix ${where}: ${note.text}`, 200);
+	return clip$1(`Fix ${where}: ${note.text}`, 200);
 }
 /** A review comment's text, on its line. */
 function commentBody(note) {
@@ -1457,7 +1546,7 @@ function checkReply(check, ctx) {
 */
 function lookReply(look, where, ctx) {
 	const at = where.sha ? ` at ${where.sha.slice(0, 7)}` : "";
-	return join$1([`**Daily brief** for ${where.date}, on ${where.branch}${at}.`], ["**What needs you**", ...where.needs], look.note ? [quiet(look.note)] : [], look.next.length > 0 ? nextList(look.next, "Ideas from the code", true) : ["No ideas worth doing from the code today."], [`Nothing was changed. Used ${ctx.usage}. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
+	return join$1([`**Daily brief** for ${where.date}, on ${where.branch}${at}.`], ["**What needs you**", ...where.needs], where.week?.length ? ["**Last 7 days**", ...where.week] : [], look.note ? [quiet(look.note)] : [], look.next.length > 0 ? nextList(look.next, "Ideas from the code", true) : ["No ideas worth doing from the code today."], [`Nothing was changed. Used ${ctx.usage}. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
 		v: 1,
 		state: "clear",
 		kind: "look",
@@ -1612,6 +1701,319 @@ async function planRed(gh, red) {
 		repo: red.repo,
 		defaultBranch: red.branch
 	} };
+}
+//#endregion
+//#region packages/aperture-bot/src/slack.ts
+/** Slack's own hosts for incoming webhooks: the secret must be one, never another address. */
+const WEBHOOK = /^https:\/\/hooks\.slack(-gov)?\.com\/services\/[A-Za-z0-9/_-]+$/;
+function isSlackWebhook(url) {
+	return WEBHOOK.test(url.trim());
+}
+/** Text as Slack shows it, never as markup: `<!channel>`, `<@U1>` and links stay words. */
+function slackEscape(text) {
+	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+/** A link the bot made, to a GitHub page. */
+function slackLink(url, text) {
+	return `<${url.replace(/[<>|\s]/g, "")}|${slackEscape(text).replace(/\|/g, "¦")}>`;
+}
+/**
+* The bot's Markdown lines (the brief's "What needs you", the week's digest)
+* as Slack text: escaped first, then bold and bullets in Slack's own marks.
+* Markdown links are left as their words: only `slackLink` makes links.
+*/
+function slackLines(lines) {
+	return lines.map((line) => slackEscape(line).replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/\*\*(.+?)\*\*/g, "*$1*").replace(/^- /, "• "));
+}
+const clip = (text, max) => {
+	const flat = text.replace(/\s+/g, " ").trim();
+	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+};
+/** The daily brief, as Slack shows it: what needs you, the week on Mondays, and how many ideas. */
+function briefMessage(brief) {
+	const at = brief.sha ? ` at ${brief.sha.slice(0, 7)}` : "";
+	return [
+		`*Daily brief* · ${slackLink(brief.repoUrl, brief.repo)} on ${slackEscape(brief.branch)}${at}`,
+		...slackLines(brief.needs),
+		...brief.note?.trim() ? ["", slackEscape(clip(brief.note, 500))] : [],
+		...brief.week?.length ? [
+			"",
+			"*Last 7 days*",
+			...slackLines(brief.week)
+		] : [],
+		"",
+		brief.ideas ? `${brief.ideas === 1 ? "1 idea" : `${brief.ideas} ideas`} from the code: ${slackLink(brief.url, "the brief")}` : slackLink(brief.url, "The brief on GitHub")
+	].join("\n");
+}
+/** A red run the bot explained: where, why in a few words, and whether it is fixing it. */
+function redMessage(red) {
+	return [
+		`*${slackEscape(red.workflow)} is red* on ${slackLink(red.repoUrl, red.repo)} ${slackEscape(red.branch)} at ${red.sha.slice(0, 7)}${red.run ? ` · ${slackLink(red.run, "the run")}` : ""}`,
+		slackEscape(clip(red.why, 400)),
+		`${slackLink(red.url, "The bot's explanation")} · ${red.fixing ? "it is fixing it now" : "tick its fix to have it done"}`
+	].join("\n");
+}
+/** A pull request the bot opened without being asked: the brief's idea, a red run's fix, a standing job. */
+function pullMessage(pull) {
+	return `*Opened a pull request* on ${slackLink(pull.repoUrl, pull.repo)}: ${slackLink(pull.url, pull.title)} · ${slackEscape(pull.why)}`;
+}
+/**
+* Posts to the webhook. Never throws: Slack being down, or the secret being
+* wrong, costs the post, not the run. The webhook's address is never logged.
+*/
+async function postToSlack(webhook, text, fetcher, log) {
+	if (!webhook) return false;
+	if (!isSlackWebhook(webhook)) {
+		log("Aperture Bot: slack-webhook is not a Slack incoming webhook (https://hooks.slack.com/services/…); nothing posted.");
+		return false;
+	}
+	try {
+		const res = await fetcher(webhook.trim(), {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				text,
+				unfurl_links: false,
+				unfurl_media: false
+			})
+		});
+		if (!res.ok) log(`Aperture Bot: Slack did not take the post (${res.status}).`);
+		return res.ok;
+	} catch {
+		log("Aperture Bot: could not reach Slack; nothing posted.");
+		return false;
+	}
+}
+function issueNumber(comment) {
+	const match = /\/issues\/(\d+)$/.exec(comment.issue_url ?? "");
+	return match ? Number(match[1]) : null;
+}
+const isBot = (comment) => comment.user?.type === "Bot";
+/** Tasks, newest first. */
+function tasksFrom(comments, threads, options = {}) {
+	const now = options.now ?? Date.now();
+	const trigger = options.trigger ?? "/aperture";
+	const replies = /* @__PURE__ */ new Map();
+	const plainBotReplies = [];
+	const tasks = [];
+	for (const comment of comments) {
+		if (!isBot(comment)) continue;
+		const summary = readSummary(comment.body ?? "");
+		if (!summary) {
+			plainBotReplies.push(comment);
+			continue;
+		}
+		const number = issueNumber(comment);
+		if (summary.via && typeof comment.id === "number" && number !== null) {
+			tasks.push({
+				id: comment.id,
+				via: summary.via,
+				number,
+				thread: threads.get(number) ?? null,
+				task: summary.task ?? "",
+				author: summary.by ?? summary.via,
+				askedAt: comment.created_at ?? "",
+				askedUrl: comment.html_url ?? "",
+				state: summary.state,
+				summary,
+				replyUrl: comment.html_url ?? null,
+				updatedAt: comment.updated_at ?? comment.created_at ?? "",
+				diff: unpushedDiff(comment.body ?? "")
+			});
+			continue;
+		}
+		const seen = replies.get(summary.asked);
+		if (!seen || (comment.updated_at ?? "") > (seen.comment.updated_at ?? "")) replies.set(summary.asked, {
+			comment,
+			summary
+		});
+	}
+	for (const comment of comments) {
+		if (isBot(comment) || typeof comment.id !== "number") continue;
+		const asked = taskFrom(comment.body ?? "", trigger);
+		const number = issueNumber(comment);
+		if (asked === null || number === null) continue;
+		const askedAt = comment.created_at ?? "";
+		const reply = replies.get(comment.id);
+		let state;
+		let replyComment = reply?.comment ?? null;
+		if (reply) state = reply.summary.state;
+		else {
+			const later = plainBotReplies.find((c) => issueNumber(c) === number && (c.created_at ?? "") >= askedAt);
+			if (later) {
+				state = "replied";
+				replyComment = later;
+			} else {
+				const age = now - Date.parse(askedAt);
+				state = Number.isFinite(age) && age > 3e5 ? "silent" : "waiting";
+			}
+		}
+		tasks.push({
+			id: comment.id,
+			via: "comment",
+			number,
+			thread: threads.get(number) ?? null,
+			task: asked,
+			author: comment.user?.login ?? "someone",
+			askedAt,
+			askedUrl: comment.html_url ?? "",
+			state,
+			summary: reply?.summary ?? null,
+			replyUrl: replyComment?.html_url ?? null,
+			updatedAt: replyComment?.updated_at ?? askedAt,
+			diff: reply ? unpushedDiff(reply.comment.body ?? "") : null
+		});
+	}
+	return tasks.sort((a, b) => a.askedAt < b.askedAt ? 1 : a.askedAt > b.askedAt ? -1 : 0);
+}
+/** Aperture Agent Check on a pull request, asked with `/aperture check` or by a push. */
+function isCheck(task) {
+	return task.summary?.kind === "check";
+}
+/** A look over the repository on the bot's schedule: a note and suggestions, nothing changed. */
+function isLook(task) {
+	return task.summary?.kind === "look";
+}
+//#endregion
+//#region src/lib/bot/week.ts
+/**
+* What the bots did in the last seven days, across the team's repositories,
+* for the stat tiles over the activity feed. Counted from the same tasks the
+* feed shows (the bot's own summaries) and the repositories' recent threads,
+* so every number is something the bot posted. Pure, for tests.
+*/
+const WEEK_MS = 6048e5;
+const EMPTY_WEEK = {
+	pulls: {
+		opened: 0,
+		merged: 0,
+		waiting: 0,
+		closed: 0
+	},
+	commits: 0,
+	reviews: 0,
+	bugs: 0,
+	checks: {
+		clear: 0,
+		red: 0
+	},
+	answered: {
+		questions: 0,
+		issues: 0,
+		red: 0
+	},
+	briefs: 0,
+	ticked: 0
+};
+function pullNumber(url) {
+	const match = /\/pull\/(\d+)(?:$|[/#?])/.exec(url ?? "");
+	return match ? Number(match[1]) : null;
+}
+/** "3 likely bugs" or "1 likely bug", as a review's summary says it; 0 for anything else. */
+function bugsIn(note) {
+	const match = /^(\d+) likely bugs?$/.exec(note ?? "");
+	return match ? Number(match[1]) : 0;
+}
+/** One repository's week: its tasks settled in the last seven days. */
+function weekFrom(tasks, threads = /* @__PURE__ */ new Map(), now = Date.now()) {
+	const week = structuredClone(EMPTY_WEEK);
+	const since = now - WEEK_MS;
+	for (const task of tasks) {
+		const at = Date.parse(task.updatedAt) || 0;
+		if (at < since || at > now + 6e4) continue;
+		if (task.via === "tick") week.ticked += 1;
+		const s = task.summary;
+		if (!s || task.state === "working" || task.state === "waiting") continue;
+		if (isLook(task)) {
+			week.briefs += 1;
+			continue;
+		}
+		if (s.kind === "review") {
+			week.reviews += 1;
+			week.bugs += bugsIn(s.note);
+			continue;
+		}
+		if (isCheck(task)) {
+			if (task.state === "clear") week.checks.clear += 1;
+			else if (task.state === "red") week.checks.red += 1;
+			continue;
+		}
+		if (s.kind === "answer") {
+			if (task.via === "issue") week.answered.issues += 1;
+			else if (task.via === "red") week.answered.red += 1;
+			else week.answered.questions += 1;
+			continue;
+		}
+		if (task.state !== "clear") continue;
+		if (s.link?.what === "commit") week.commits += 1;
+		if (s.link?.what === "pull") {
+			week.pulls.opened += 1;
+			const n = pullNumber(s.link.url);
+			const thread = n === null ? void 0 : threads.get(n);
+			if (thread?.merged) week.pulls.merged += 1;
+			else if (thread?.open) week.pulls.waiting += 1;
+			else if (thread) week.pulls.closed += 1;
+		}
+	}
+	return week;
+}
+/** True when nothing happened: the tiles are left out rather than a row of zeros. */
+function quietWeek(w) {
+	return w.pulls.opened + w.commits + w.reviews + w.checks.clear + w.checks.red + w.answered.questions + w.answered.issues + w.answered.red + w.briefs + w.ticked === 0;
+}
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+/** The week as tiles: a label, the number, and one line of what is in it. Zero parts are left out. */
+function weekTiles(w) {
+	const parts = (list) => list.filter(([n]) => n > 0).map(([n, text]) => `${n} ${text}`).join(" · ");
+	const answered = w.answered.questions + w.answered.issues + w.answered.red;
+	return [
+		{
+			label: "Pull requests opened",
+			value: w.pulls.opened,
+			detail: parts([
+				[w.pulls.merged, "merged"],
+				[w.pulls.waiting, "waiting for review"],
+				[w.pulls.closed, "closed"]
+			]) || (w.commits ? "" : "None this week")
+		},
+		{
+			label: "Likely bugs caught",
+			value: w.bugs,
+			detail: w.reviews ? `In ${plural(w.reviews, "review")}` : "No reviews this week"
+		},
+		{
+			label: "Answered",
+			value: answered,
+			detail: parts([
+				[w.answered.questions, w.answered.questions === 1 ? "question" : "questions"],
+				[w.answered.issues, w.answered.issues === 1 ? "new issue" : "new issues"],
+				[w.answered.red, w.answered.red === 1 ? "red run" : "red runs"]
+			]) || "Nothing asked this week"
+		},
+		{
+			label: "Pull requests checked",
+			value: w.checks.clear + w.checks.red,
+			detail: parts([[w.checks.clear, "clear"], [w.checks.red, "found red"]]) || "No checks this week"
+		}
+	].map((tile) => tile.label === "Pull requests opened" && w.commits ? {
+		...tile,
+		detail: [tile.detail, `${plural(w.commits, "fix", "fixes")} pushed to open ones`].filter(Boolean).join(" · ")
+	} : tile);
+}
+/** The line under the tiles: the briefs and the ticks, when there were any. */
+function weekNote(w) {
+	const bits = [w.briefs ? plural(w.briefs, "daily brief") : "", w.ticked ? `${plural(w.ticked, "suggestion")} ticked` : ""].filter(Boolean);
+	return bits.length ? `Also ${bits.join(", and ")}.` : null;
+}
+/**
+* The week as Markdown lines, for the digest the daily brief carries on
+* Mondays: the tiles' words, so the brief and the Bot page say the same.
+*/
+function weekLines(w) {
+	if (quietWeek(w)) return ["Nothing from the bot in the last 7 days."];
+	const lines = weekTiles(w).map((t) => t.value === 0 && (!t.detail || /^(No|None|Nothing)\b/.test(t.detail)) ? `- **${t.label}**: none` : `- **${t.label}**: ${t.value}${t.detail ? ` (${t.detail})` : ""}`);
+	const note = weekNote(w);
+	return note ? [...lines, note] : lines;
 }
 //#endregion
 //#region packages/aperture-bot/src/seal.ts
@@ -1827,7 +2229,7 @@ async function runAction(env, deps = {}) {
 	try {
 		payload = JSON.parse((0, node_fs.readFileSync)(env.GITHUB_EVENT_PATH ?? "", "utf8"));
 	} catch {}
-	const parsed = parseEvent(env.GITHUB_EVENT_NAME ?? "", payload, input(env, "trigger") ?? "/aperture", input(env, "label") ?? "aperture");
+	let parsed = parseEvent(env.GITHUB_EVENT_NAME ?? "", payload, input(env, "trigger") ?? "/aperture", input(env, "label") ?? "aperture", /^(true|yes|on)$/i.test(input(env, "follow-threads") ?? ""));
 	const ignore = (why) => {
 		log(`Aperture Bot: nothing to do: ${why}`);
 		setOutput(env, { outcome: "ignored" });
@@ -1836,7 +2238,7 @@ async function runAction(env, deps = {}) {
 	if ("ignored" in parsed) return ignore(parsed.ignored);
 	const job = "scheduled" in parsed ? jobFrom(input(env, "scheduled")) : null;
 	if ("scheduled" in parsed && !job) return ignore("the workflow ran on its schedule, but its scheduled input is empty.");
-	const [owner, name] = "command" in parsed ? [parsed.command.owner, parsed.command.repo] : "red" in parsed ? [parsed.red.owner, parsed.red.repo] : (env.GITHUB_REPOSITORY ?? "").split("/");
+	const [owner, name] = "command" in parsed ? [parsed.command.owner, parsed.command.repo] : "red" in parsed ? [parsed.red.owner, parsed.red.repo] : "follow" in parsed ? [parsed.follow.owner, parsed.follow.repo] : (env.GITHUB_REPOSITORY ?? "").split("/");
 	if (!owner || !name) throw new Error("GITHUB_REPOSITORY is not owner/repo.");
 	const token = input(env, "github-token") ?? env.GITHUB_TOKEN;
 	if (!token) throw new Error("github-token is empty.");
@@ -1857,6 +2259,56 @@ async function runAction(env, deps = {}) {
 		}).length;
 		return sent >= limit ? `it already replied unasked ${sent} times in the last day (daily-limit: ${limit}).` : null;
 	};
+	/**
+	* A comment that follows one of the bot's replies (`follow-threads`), from
+	* someone who can write and, when the reply answered someone, from them:
+	* "yes" or "do the second one" does that suggestion, as a tick would (the
+	* reply's signature is checked below); thanks are let be; anything else is
+	* answered, changing nothing. Every other comment is left alone.
+	*/
+	if ("follow" in parsed) {
+		const f = parsed.follow;
+		if (!canWrite(await gh.permission(f.author))) return ignore(`@${f.author} cannot write; the bot follows only people who can.`);
+		if (mentionsSomeone(f.text)) return ignore("the comment @mentions someone, so it is addressed to them.");
+		const thread = await gh.comments(f.number);
+		const at = thread.findIndex((c) => c.id === f.commentId);
+		const prev = at > 0 ? thread[at - 1] : void 0;
+		const summary = prev ? readSummary(prev.body) : null;
+		if (!prev || !summary || summary.state === "working") return ignore("the comment does not follow one of the bot's replies.");
+		const asker = askerOf(summary, thread);
+		if (asker && asker.toLowerCase() !== f.author.toLowerCase()) return ignore(`the bot's reply answered @${asker}, so it follows only them.`);
+		const kind = followKind(f.text);
+		if (kind.kind === "thanks") return ignore("the comment needs no answer.");
+		const pick = kind.kind === "do" ? summary.next?.[kind.index] : void 0;
+		if (kind.kind === "do" && !pick) return ignore(`the bot's reply has no suggestion ${kind.index + 1} to do.`);
+		const base = {
+			number: f.number,
+			isPull: f.isPull,
+			title: f.title,
+			body: f.body,
+			commentId: f.commentId,
+			author: f.author,
+			via: "comment",
+			follows: prev.id,
+			owner: f.owner,
+			repo: f.repo,
+			defaultBranch: f.defaultBranch
+		};
+		parsed = { command: pick ? {
+			...base,
+			task: pick,
+			ticked: {
+				commentId: prev.id,
+				body: prev.body,
+				postedBy: null
+			}
+		} : {
+			...base,
+			task: f.text.trim(),
+			ask: true
+		} };
+		log(`Aperture Bot: following #${f.number}: ${pick ? `doing ${pick}` : "answering"}`);
+	}
 	let command;
 	if ("command" in parsed && parsed.command.triage) {
 		command = parsed.command;
@@ -1926,6 +2378,12 @@ async function runAction(env, deps = {}) {
 	let edits = Promise.resolve();
 	/** The comment the last reply went to, and what it said: the red fix marks its box there. */
 	let replied = null;
+	/** The answer's words, for Slack's line on a red run. */
+	let answeredText = "";
+	/** The bot's last reply on GitHub, for Slack's links back. */
+	const commentUrl = () => replied ? `${repoUrl}/issues/${command.number}#issuecomment-${replied.id}` : `${repoUrl}/issues/${command.number}`;
+	/** `slack-webhook`: unasked work is told on Slack too (`slack.ts`). */
+	const toSlack = (text) => postToSlack(input(env, "slack-webhook"), text, deps.fetch ?? fetch, log);
 	const reply = async (body) => {
 		await edits;
 		if (status === null) replied = {
@@ -2012,6 +2470,26 @@ async function runAction(env, deps = {}) {
 		ideas: [],
 		waiting: null
 	};
+	/**
+	* On Mondays (UTC), the brief carries the week's digest: what the bot did in
+	* the last seven days, counted from its own summaries on GitHub as the Bot
+	* page counts them. No model call; if GitHub cannot say, the brief goes
+	* without it.
+	*/
+	const mondayDigest = async (now) => {
+		if (new Date(now).getUTCDay() !== 1) return void 0;
+		try {
+			const since = (/* @__PURE__ */ new Date(now - WEEK_MS - 864e5)).toISOString();
+			const [raw, threads] = await Promise.all([gh.rawCommentsSince(since), gh.threadsSince(since)]);
+			return weekLines(weekFrom(tasksFrom(raw, threads, {
+				now,
+				trigger: input(env, "trigger") ?? "/aperture"
+			}), threads, now));
+		} catch (error) {
+			log(`Aperture Bot: the week's digest is left out: ${require_run.describeError(error)}`);
+			return;
+		}
+	};
 	const lookOver = async () => {
 		const branch = command.defaultBranch;
 		const sha = await gh.head(branch);
@@ -2032,7 +2510,7 @@ async function runAction(env, deps = {}) {
 				updatedAt: p.updatedAt,
 				bots: p.headRef.startsWith("aperture/")
 			})),
-			now: Date.now()
+			now: deps.now?.() ?? Date.now()
 		};
 		log(`Aperture Bot: looking ${command.owner}/${command.repo} over`);
 		const brief = briefQuestion(view, todoLines(cwd));
@@ -2060,14 +2538,28 @@ async function runAction(env, deps = {}) {
 			day: "numeric",
 			timeZone: "UTC"
 		});
+		const week = await mondayDigest(view.now);
+		const needs = needsYou(view);
 		await reply(lookReply(look, {
 			branch,
 			sha,
-			needs: needsYou(view),
-			date
+			needs,
+			date,
+			week
 		}, {
 			...asked,
 			usage: result.usage
+		}));
+		await toSlack(briefMessage({
+			repo: `${command.owner}/${command.repo}`,
+			repoUrl,
+			branch,
+			sha,
+			needs,
+			note: look.note,
+			week,
+			ideas: look.next.length,
+			url: commentUrl()
 		}));
 		setOutput(env, { outcome: "clear" });
 		return 0;
@@ -2108,6 +2600,7 @@ async function runAction(env, deps = {}) {
 			next
 		};
 		log([answered.answer, ...next.map((task) => `- ${task}`)].join("\n"));
+		answeredText = result.answer;
 		await reply(answerReply(answered, {
 			...asked,
 			usage: result.usage
@@ -2246,7 +2739,19 @@ async function runAction(env, deps = {}) {
 				unasked: true,
 				heading: `**${command.red.workflow} is red on ${command.red.branch}** at ${sha}.${command.red.url ? ` [The run](${command.red.url})` : ""}`
 			});
-			if (!alwaysAllowed(input(env, "always-allow")).has("red")) return code;
+			const fixing = alwaysAllowed(input(env, "always-allow")).has("red");
+			if (replied) await toSlack(redMessage({
+				repo: `${command.owner}/${command.repo}`,
+				repoUrl,
+				workflow: command.red.workflow,
+				branch: command.red.branch,
+				sha: command.red.sha,
+				run: command.red.url ?? "",
+				why: answeredText,
+				url: commentUrl(),
+				fixing
+			}));
+			if (!fixing) return code;
 			const said = replied;
 			if (said) {
 				const marked = markStarted(said.body, command.task, "always-allow: red", runUrl);
@@ -2328,6 +2833,13 @@ async function runAction(env, deps = {}) {
 					url: opened.url,
 					what: "pull"
 				}, ctx));
+				if (command.via === "schedule" || command.via === "red") await toSlack(pullMessage({
+					repo: `${command.owner}/${command.repo}`,
+					repoUrl,
+					title: titleFor(command),
+					url: opened.url,
+					why: command.idea ? "an idea from its daily brief" : command.via === "red" ? "the fix for red CI" : "its standing job"
+				}));
 				setOutput(env, {
 					outcome: "clear",
 					"pull-request": opened.url,
