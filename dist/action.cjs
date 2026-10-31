@@ -1,6 +1,7 @@
 const require_run = require("./run-BYS1h24Q.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
+let node_crypto = require("node:crypto");
 let node_child_process = require("node:child_process");
 //#region packages/aperture-bot/src/answer.ts
 const MAX_ANSWER = 6e3;
@@ -181,8 +182,8 @@ function suggestionBoxes(next) {
 }
 //#endregion
 //#region src/lib/bot/summary.ts
-const OPEN = "<!-- aperture-bot ";
-const CLOSE = " -->";
+const OPEN$1 = "<!-- aperture-bot ";
+const CLOSE$1 = " -->";
 const LIMITS = {
 	plan: 7,
 	checks: 30,
@@ -215,7 +216,7 @@ function bounded(summary) {
 */
 function summaryMarker(summary) {
 	const json = JSON.stringify(bounded(summary)).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
-	return `${OPEN}${json}${CLOSE}`;
+	return `${OPEN$1}${json}${CLOSE$1}`;
 }
 const STATES = /* @__PURE__ */ new Set([
 	"working",
@@ -236,9 +237,9 @@ const strings = (value) => Array.isArray(value) ? value.filter(isString) : void 
 * github.com link is kept.
 */
 function readSummary(body) {
-	const start = body.lastIndexOf(OPEN);
+	const start = body.lastIndexOf(OPEN$1);
 	if (start < 0) return null;
-	const end = body.indexOf(CLOSE, start + 18);
+	const end = body.indexOf(CLOSE$1, start + 18);
 	if (end < 0) return null;
 	let raw;
 	try {
@@ -267,6 +268,7 @@ function readSummary(body) {
 	out.files = strings(r.files);
 	const next = strings(r.next)?.slice(0, LIMITS.next).map((task) => clip$1(task, LIMITS.text));
 	if (next?.length) out.next = next;
+	if (typeof r.sig === "string" && /^[0-9a-f]{32}$/.test(r.sig)) out.sig = r.sig;
 	if (Array.isArray(r.checks)) out.checks = r.checks.flatMap((row) => {
 		const c = row;
 		return typeof c?.status === "string" && typeof c.label === "string" && typeof c.detail === "string" ? [{
@@ -557,6 +559,11 @@ var GitHub = class {
 		this.api = api;
 		this.fetcher = fetcher;
 	}
+	/**
+	* Applied to every comment body as it is posted or edited: the run sets it
+	* to sign the suggestion lists in its replies (`seal.ts`).
+	*/
+	seal = (body) => body;
 	async call(method, path, body, accept = "application/vnd.github+json") {
 		const res = await require_run.retryStale(() => this.fetcher(`${this.api}${path}`, {
 			method,
@@ -637,7 +644,7 @@ var GitHub = class {
 	}
 	/** Posts a comment; `by` is who the token posts as, which names the bot's commits. */
 	async comment(issue, body) {
-		const out = await this.call("POST", `${this.base}/issues/${issue}/comments`, { body });
+		const out = await this.call("POST", `${this.base}/issues/${issue}/comments`, { body: this.seal(body) });
 		const by = out.user?.login && typeof out.user.id === "number" ? {
 			login: out.user.login,
 			id: out.user.id
@@ -729,7 +736,7 @@ var GitHub = class {
 		}));
 	}
 	async editComment(id, body) {
-		await this.call("PATCH", `${this.base}/issues/comments/${id}`, { body });
+		await this.call("PATCH", `${this.base}/issues/comments/${id}`, { body: this.seal(body) });
 	}
 };
 /** Write access, the bar for asking the bot to change the repository. */
@@ -1360,6 +1367,26 @@ function forkReply(ctx) {
 		run: ctx.run
 	})]);
 }
+/**
+* A ticked box in a list the bot did not sign for this thread: another bot's
+* look-alike, a copy from elsewhere, or a reply from before the bot signed
+* its suggestions (`seal.ts`). Nothing starts; the task is shown, quietly, so
+* a maintainer who meant it can ask for it.
+*/
+function unsignedTickReply(ctx, task, trigger) {
+	return join$1([
+		"Ticking that box started nothing: Aperture Bot signs the suggestions it lists, and that list has no signature the bot made for this thread. It may come from another bot, be copied from elsewhere, or be older than the signatures.",
+		"",
+		`> ${quiet(task.replace(/\s+/g, " ").trim())}`,
+		"",
+		`If you want it done, comment \`${trigger}\` followed by the task.`
+	], [summaryMarker({
+		v: 1,
+		state: "declined",
+		asked: ctx.asked,
+		run: ctx.run
+	})]);
+}
 /** `/aperture check` on an issue: there is no change to check. */
 function notPullReply(ctx, what = "check") {
 	return join$1([
@@ -1571,6 +1598,66 @@ async function planRed(gh, red) {
 		repo: red.repo,
 		defaultBranch: red.branch
 	} };
+}
+//#endregion
+//#region packages/aperture-bot/src/seal.ts
+/**
+* The bot's suggestion lists, signed. Ticking a box in a reply runs its
+* suggestion as a task, so a list must be one this bot wrote: another bot
+* (any GitHub App on the repository, or another workflow posting as
+* github-actions) could post a comment that looks like the bot's reply, with
+* a summary listing a task nobody suggested, and a maintainer who ticks it
+* would start it.
+*
+* So the summary of every comment the bot posts carries `sig`, an HMAC of its
+* suggestions, the repository and the thread, keyed from the model key: only
+* a workflow holding that secret can sign. A tick on a list without a valid
+* `sig` (another bot's, a copy from another thread, or a reply from before
+* the bot signed) starts nothing. Pure, for tests.
+*/
+const OPEN = "<!-- aperture-bot ";
+const CLOSE = " -->";
+const SIG = /,"sig":"[0-9a-f]*"(?=\}$)/;
+/**
+* The signing key, derived from the model key so the key itself never signs
+* anything; null without one, and then nothing is signed.
+*/
+function sealKey(secret) {
+	return secret ? (0, node_crypto.createHmac)("sha256", secret).update("aperture-bot suggestions v1").digest() : null;
+}
+/** The signature of a list of suggestions on a thread: 32 hex characters. */
+function suggestionSig(key, scope, next) {
+	return (0, node_crypto.createHmac)("sha256", key).update(JSON.stringify([
+		scope.repo.toLowerCase(),
+		scope.number,
+		next
+	])).digest("hex").slice(0, 32);
+}
+/**
+* The body with its summary signed, when the summary lists suggestions. The
+* list signed is the one `readSummary` reads back, so the tick checks exactly
+* what it would run. Any other body is returned as it is.
+*/
+function sealBody(body, key, scope) {
+	if (!key) return body;
+	const next = readSummary(body)?.next;
+	if (!next?.length) return body;
+	const start = body.lastIndexOf(OPEN);
+	const end = body.indexOf(CLOSE, start + 18);
+	if (start < 0 || end < 0) return body;
+	const json = body.slice(start + 18, end).replace(SIG, "");
+	if (!json.endsWith("}")) return body;
+	const signed = `${json.slice(0, -1)},"sig":"${suggestionSig(key, scope, next)}"}`;
+	return `${body.slice(0, start + 18)}${signed}${body.slice(end)}`;
+}
+/** True when the body's suggestions were signed by this bot, for this thread. */
+function isSealed(body, key, scope) {
+	if (!key) return false;
+	const summary = readSummary(body);
+	if (!summary?.next?.length || !summary.sig) return false;
+	const want = Buffer.from(suggestionSig(key, scope, summary.next));
+	const got = Buffer.from(summary.sig);
+	return got.length === want.length && (0, node_crypto.timingSafeEqual)(got, want);
 }
 //#endregion
 //#region packages/aperture-bot/src/action.ts
@@ -1801,6 +1888,19 @@ async function runAction(env, deps = {}) {
 			task: command.task
 		}
 	};
+	const key = sealKey(input(env, "model-key") ?? "");
+	const scope = {
+		repo: `${command.owner}/${command.repo}`,
+		number: command.number
+	};
+	gh.seal = (body) => sealBody(body, key, scope);
+	if (command.ticked && !isSealed(command.ticked.body, key, scope)) {
+		log("Aperture Bot: the ticked suggestion is not signed by this bot for this thread; it is not a task.");
+		const trigger = input(env, "trigger") ?? "/aperture";
+		await gh.comment(command.number, unsignedTickReply(asked, command.task, trigger)).catch(() => void 0);
+		setOutput(env, { outcome: "ignored" });
+		return 0;
+	}
 	if (command.ticked) {
 		const marked = markStarted(command.ticked.body, command.task, command.author, runUrl);
 		if (marked) await gh.editComment(command.ticked.commentId, marked).catch(() => void 0);
