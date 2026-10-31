@@ -158,9 +158,13 @@ function tickedTask(before, after, next) {
 	const now = boxes(after).filter((box) => box.ticked && wanted.has(box.text) && was.get(box.text) === false);
 	return now.length === 1 ? now[0].text : null;
 }
-/** The line as it reads once its run has started: ticked, who asked, and the run. */
+/**
+* The line as it reads once its run has started: ticked, who asked, and the
+* run. Started by an `always-allow` setting, it names the setting, not a
+* GitHub user (an @ there would ping whoever has that name).
+*/
 function startedLine(task, by, run) {
-	return `- [x] ${task} · started by @${by}, [the run](${run})`;
+	return `- [x] ${task} · started ${by.startsWith("always-allow") ? `without a tick (\`${by}\`)` : `by @${by}`}, [the run](${run})`;
 }
 /**
 * The reply with the ticked suggestion marked started, or null when the line
@@ -424,6 +428,7 @@ function ticked(event) {
 			body: comment.body ?? "",
 			postedBy: comment.user?.type === "Bot" ? null : comment.user?.login ?? ""
 		},
+		...summary.kind === "look" ? { keepOpen: true } : {},
 		owner: repo.owner.login,
 		repo: repo.name,
 		defaultBranch: repo.default_branch ?? "main"
@@ -771,6 +776,14 @@ function days(at, now) {
 	const then = at ? Date.parse(at) : NaN;
 	return Number.isFinite(then) ? Math.max(0, Math.floor((now - then) / 864e5)) : null;
 }
+/**
+* The idea `always-allow: brief` does at once: the first that comes from the
+* code alone. One that names an issue (#12) waits for a tick, since anyone
+* can open an issue and its words would become the task.
+*/
+function ideaToDo(next) {
+	return next.find((task) => !/#\d/.test(task)) ?? null;
+}
 const dayWord = (n) => n === 1 ? "1 day" : `${n} days`;
 /** An issue's title as the brief shows it: anyone wrote it, so its @mentions stay quiet. */
 const title = (t) => quiet(t.title.replace(/\s+/g, " ").trim().slice(0, 120));
@@ -816,7 +829,7 @@ function briefQuestion(view, todos) {
 	return {
 		question: [
 			"This is your daily brief on this repository. Look through its code with your tools, and the state below.",
-			`First write at most 3 short sentences on how it stands. Then a line "Next:" and at most 5 ideas worth doing now, each one precise task under 200 characters that you, a coding bot, could do by changing the code: a likely bug, an important path with no test, a TODO worth finishing, a fix for what is red, or what an open issue asks (name it, #12).`,
+			`First write at most 3 short sentences on how it stands. Then a line "Next:" and at most 5 ideas worth doing now, the one most worth doing first, each one precise task under 200 characters that you, a coding bot, could do by changing the code: a likely bug, an important path with no test, a TODO worth finishing, a fix for what is red, or what an open issue asks (name it, #12).`,
 			"Only ideas the code or the state shows you; name the file. Never suggest what only people can do, such as reviewing, replying or closing. If nothing is worth doing, write \"Next: none\"."
 		].join(" "),
 		context: [
@@ -1186,6 +1199,7 @@ const SITE = "https://aperturesais.grok.me";
 /** How the asking reads in a commit or a pull request: who asked, and how. */
 function askedBy(command) {
 	if (command.via === "label") return `@${command.author} labelled #${command.number} for the bot`;
+	if (command.idea) return `An idea from the daily brief in #${command.number}, started without a tick (\`always-allow: brief\`)`;
 	if (command.via === "schedule") return `A standing job, on #${command.number}`;
 	if (command.via === "pull") return `@${command.author} pushed to #${command.number}`;
 	if (command.via === "tick") return `@${command.author} ticked a suggestion of Aperture Bot's in #${command.number}`;
@@ -1201,7 +1215,7 @@ const askedFields = (ctx) => ctx.via ? {
 } : {};
 /** A title for the commit and the pull request: the task's first line, or the issue's title. */
 function titleFor(command) {
-	if (command.via === "schedule") {
+	if (command.via === "schedule" && !command.idea) {
 		const job = command.title.replace(/^Aperture Bot: /, "");
 		return `${job.charAt(0).toUpperCase()}${job.slice(1)}`.slice(0, 72);
 	}
@@ -1280,7 +1294,7 @@ function pullBody(command, result, runUrl, where) {
 		`${askedBy(command)}:`,
 		"",
 		`> ${quiet(firstLine(command.task))}`
-	], command.isPull ? [] : [`Fixes #${command.number}`], plan(result), [
+	], command.isPull || command.idea || command.keepOpen ? [] : [`Fixes #${command.number}`], plan(result), [
 		`**Aperture Agent Check**: ${result.check?.verdict === "clear" ? "nothing red" : "red"}.`,
 		"",
 		...checksTable(result)
@@ -1699,12 +1713,13 @@ function setOutput(env, values) {
 }
 /**
 * The kinds of work the bot may start without a tick, from the `always-allow`
-* input. Only `red` for now: fixing a workflow red on the default branch,
-* which is what the nightly fix-ci job does too.
+* input: `red` fixes a workflow red on the default branch, which is what the
+* nightly fix-ci job does too; `brief` does the daily brief's first idea from
+* the code, one at a time.
 */
 function alwaysAllowed(value) {
 	const words = (value ?? "").toLowerCase().split(/[\s,]+/);
-	return new Set(words.includes("red") ? ["red"] : []);
+	return new Set(["red", "brief"].filter((word) => words.includes(word)));
 }
 /** What a push to a pull request starts, from the `pull-requests` input: Agent Check, a review, or both. */
 function pullModes(value) {
@@ -1990,8 +2005,13 @@ async function runAction(env, deps = {}) {
 	/**
 	* The look-over: how the repository stands (CI on the default branch, open
 	* issues and pull requests), one model call, and a report on its issue.
-	* It checks nothing out and changes nothing.
+	* It checks nothing out and changes nothing. Its ideas, and the bot's open
+	* pull requests, are kept for `always-allow: brief`.
 	*/
+	let briefed = {
+		ideas: [],
+		waiting: null
+	};
 	const lookOver = async () => {
 		const branch = command.defaultBranch;
 		const sha = await gh.head(branch);
@@ -2028,6 +2048,11 @@ async function runAction(env, deps = {}) {
 		const look = {
 			note: result.answer,
 			next: result.next
+		};
+		const waiting = pulls.find((p) => p.headRef.startsWith(`aperture/${command.number}-`));
+		briefed = {
+			ideas: look.next,
+			waiting: waiting?.url ?? null
 		};
 		log([look.note, ...look.next.map((task) => `- ${task}`)].filter(Boolean).join("\n"));
 		const date = new Date(view.now).toLocaleDateString("en-US", {
@@ -2180,7 +2205,33 @@ async function runAction(env, deps = {}) {
 			return code;
 		}
 		if (command.review) return await reviewPull();
-		if (command.look) return await lookOver();
+		if (command.look) {
+			const code = await lookOver();
+			if (command.via !== "schedule" || !alwaysAllowed(input(env, "always-allow")).has("brief")) return code;
+			const idea = ideaToDo(briefed.ideas);
+			if (!idea) {
+				log("Aperture Bot: always-allow brief: no idea from the code alone; ideas naming an issue wait for a tick.");
+				return code;
+			}
+			if (briefed.waiting) {
+				log(`Aperture Bot: always-allow brief: the last idea's pull request waits for review: ${briefed.waiting}`);
+				return code;
+			}
+			const said = replied;
+			if (said) {
+				const marked = markStarted(said.body, idea, "always-allow: brief", runUrl);
+				if (marked) await gh.editComment(said.id, marked).catch(() => void 0);
+			}
+			command = {
+				...command,
+				task: idea,
+				look: false,
+				idea: true
+			};
+			asked.task = idea;
+			status = null;
+			log(`Aperture Bot: always-allow brief: doing ${idea}`);
+		}
 		if (command.ask) return await answer({ question: questionText(command.task) });
 		if (command.triage) return await answer({
 			question: TRIAGE_QUESTION,
@@ -2198,7 +2249,7 @@ async function runAction(env, deps = {}) {
 			if (!alwaysAllowed(input(env, "always-allow")).has("red")) return code;
 			const said = replied;
 			if (said) {
-				const marked = markStarted(said.body, command.task, "always-allow", runUrl);
+				const marked = markStarted(said.body, command.task, "always-allow: red", runUrl);
 				if (marked) await gh.editComment(said.id, marked).catch(() => void 0);
 			}
 			status = null;
