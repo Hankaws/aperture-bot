@@ -151944,6 +151944,26 @@ function jsonIssues(text) {
 * be certain about is silently allowed.
 */
 const MAX_PARSE_CHARS$1 = 4e5;
+/**
+* The last answer per file path, for as long as the file's text is the same
+* string. The editor asks about every unchanged file again on each keystroke;
+* parsing them all again froze it on real projects.
+*/
+const MEMO_MAX = 4e3;
+function memoByText(memo, path, text, read) {
+	const hit = memo.get(path);
+	if (hit && hit.text === text) return hit.value;
+	const value = read();
+	memo.delete(path);
+	memo.set(path, {
+		text,
+		value
+	});
+	if (memo.size > MEMO_MAX) memo.delete(memo.keys().next().value);
+	return value;
+}
+const importsMemo = /* @__PURE__ */ new Map();
+const exportsMemo = /* @__PURE__ */ new Map();
 const MAX_ISSUES$2 = 4;
 /** Tried in order against a relative specifier, longest-lived conventions first. */
 const EXTENSIONS = [
@@ -152027,7 +152047,11 @@ function groupNames(text, side) {
 		return ((side === "left" ? halves[0] : halves[1] ?? halves[0]) ?? "").replace(/\btype\b/g, "").trim();
 	}).filter((name) => /^[A-Za-z_$][\w$]*$/.test(name));
 }
+/** The file's imports. Callers must not change the array: it is shared while the text is unchanged. */
 function collectImports(path, text) {
+	return memoByText(importsMemo, path, text, () => readImports(path, text));
+}
+function readImports(path, text) {
 	if (text.length > MAX_PARSE_CHARS$1) return [];
 	let tree;
 	try {
@@ -152079,7 +152103,11 @@ function collectImports(path, text) {
 	});
 	return refs;
 }
+/** The file's exports. Callers must not change the set: it is shared while the text is unchanged. */
 function collectExports(path, text) {
+	return memoByText(exportsMemo, path, text, () => readExports(path, text));
+}
+function readExports(path, text) {
 	const names = /* @__PURE__ */ new Set();
 	if (text.length > MAX_PARSE_CHARS$1) return {
 		names,
@@ -154736,6 +154764,186 @@ function repoMap(files, maxChars = 5e3) {
 	return lines.join("\n");
 }
 //#endregion
+//#region src/lib/security/redact.ts
+/** Shared guards: secret-looking paths and tokens never go to Composer. */
+const SKIP_SECRET_FILES = /* @__PURE__ */ new Set([
+	".env",
+	".env.local",
+	".env.production",
+	".env.development",
+	".env.staging",
+	".netrc",
+	".npmrc",
+	".pypirc",
+	"id_rsa",
+	"id_dsa",
+	"id_ecdsa",
+	"id_ed25519",
+	"credentials.json",
+	"service-account.json",
+	".bash_history",
+	".zsh_history",
+	"wallet.dat"
+]);
+const SKIP_SECRET_EXT = /* @__PURE__ */ new Set([
+	"pem",
+	"p12",
+	"pfx",
+	"key",
+	"kdbx",
+	"jks",
+	"keystore",
+	"ovpn"
+]);
+/**
+* A name that holds a secret, also inside a longer one (DB_PASSWORD, clientSecret,
+* STRIPE_SECRET_KEY), then `:` or `=` (never `==`, `===` or `=>`). A quoted name
+* counts only where an object key can stand, so `cond ? "new-password" : "x"` does not.
+*/
+const SECRET_NAME = String.raw`[\w$-]*(?:api[_-]?key|auth[_-]?token|authorization|secret|passwd|password|private[_-]?key|access[_-]?token|npm[_-]?token)[\w$-]*`;
+const SECRET_KEY = new RegExp(String.raw`((?<![\w$-])${SECRET_NAME}|(?<=(?:^|[{,])\s*)(["'])${SECRET_NAME}\2)(\s*[:=](?![=>])\s*)`, "gim");
+/** A quoted value: the secret is between the quotes, which stay so the line still parses. */
+const QUOTED = /(["'`])((?:(?!\1)[^\n\\]|\\.)*)\1/y;
+/** A bare value outside code: a run of characters, not a flag or a reference to another variable. */
+const BARE = /(?!(?:true|false|null|none|undefined)\b|\[redacted)(?![$%]|process\.env|import\.meta|os\.environ)[^\s"'`,;)}\]]{6,}/iy;
+/** A quoted value that reads as a sentence (a label, a message) or as an environment variable's name. */
+const NOT_A_SECRET = /^(?:[^ ]* ){5,}|^[A-Z][A-Z0-9_]*$/;
+/** Files where a bare value after `password =` is an expression, not the password. */
+const CODE_EXT$1 = /* @__PURE__ */ new Set([
+	"ts",
+	"tsx",
+	"js",
+	"jsx",
+	"mjs",
+	"cjs",
+	"mts",
+	"cts",
+	"vue",
+	"svelte",
+	"astro",
+	"py",
+	"go",
+	"rb",
+	"java",
+	"kt",
+	"rs",
+	"php",
+	"cs",
+	"swift",
+	"dart",
+	"scala"
+]);
+function isCodePath(path) {
+	const base = path?.split("/").pop() ?? "";
+	const dot = base.lastIndexOf(".");
+	return dot > 0 && CODE_EXT$1.has(base.slice(dot + 1).toLowerCase());
+}
+/** Replaces the value after each secret name: a quoted literal always, a bare one only outside code. */
+function redactValues(text, code) {
+	let out = "";
+	let last = 0;
+	SECRET_KEY.lastIndex = 0;
+	for (let match = SECRET_KEY.exec(text); match; match = SECRET_KEY.exec(text)) {
+		const at = match.index + match[0].length;
+		let end = -1;
+		let replacement = "";
+		QUOTED.lastIndex = at;
+		const quoted = QUOTED.exec(text);
+		if (quoted) {
+			const value = quoted[2];
+			if (value.trim().length >= 6 && !value.includes("${") && !NOT_A_SECRET.test(value)) {
+				end = at + quoted[0].length;
+				replacement = `${quoted[1]}[redacted]${quoted[1]}`;
+			}
+		} else if (!code) {
+			BARE.lastIndex = at;
+			const bare = BARE.exec(text);
+			if (bare) {
+				end = at + bare[0].length;
+				replacement = "[redacted]";
+			}
+		}
+		if (end < 0) continue;
+		out += text.slice(last, at) + replacement;
+		last = end;
+		SECRET_KEY.lastIndex = end;
+	}
+	return out + text.slice(last);
+}
+const KEY_LIKE = /\b(sk-[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]{16,}|sk-proj-[A-Za-z0-9_-]{16,}|xai-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|Bearer\s+(?!\$\{)[A-Za-z0-9\-._~+/]{20,}=*)\b/g;
+const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
+function safeRelPath(path) {
+	const n = path.replace(/\\/g, "/").replace(/^\//, "").replace(/\0/g, "");
+	if (!n || n.length > 240) return null;
+	const parts = n.split("/").filter((p) => p && p !== ".");
+	if (parts.length === 0) return null;
+	if (parts.some((p) => p === ".." || p === "~")) return null;
+	return parts.join("/");
+}
+function isSecretPath(path) {
+	const safe = safeRelPath(path);
+	if (!safe) return true;
+	const base = (safe.split("/").pop() ?? safe).toLowerCase();
+	if (SKIP_SECRET_FILES.has(base)) return true;
+	if (base.startsWith(".env") && base !== ".env.example") return true;
+	if (base.includes("service-account") && base.endsWith(".json")) return true;
+	const dot = base.lastIndexOf(".");
+	const ext = dot >= 0 ? base.slice(dot + 1) : "";
+	return SKIP_SECRET_EXT.has(ext);
+}
+/**
+* Text with keys, tokens and passwords replaced by [redacted]. Pass the file's
+* path when there is one: in code, only quoted values are secrets.
+*/
+function redactSecrets(text, path) {
+	if (!text) return text;
+	return redactValues(text.replace(PEM_BLOCK, "[redacted private key]"), isCodePath(path)).replace(KEY_LIKE, "[redacted]");
+}
+function sanitizeFileMap(files) {
+	const out = {};
+	for (const [path, content] of Object.entries(files)) {
+		const safe = safeRelPath(path);
+		if (!safe || isSecretPath(safe)) continue;
+		out[safe] = redactSecrets(typeof content === "string" ? content : "", safe);
+	}
+	return out;
+}
+const MAX_AGENT_TOTAL_CHARS = 25e5;
+/** Why an edit to these paths is refused: a file the agent was not sent, or a folder holding one. */
+function leftOutRefusal(leftOut, ...paths) {
+	if (!leftOut?.size) return null;
+	for (const path of paths) {
+		if (!path) continue;
+		const hit = leftOut.has(path) ? path : [...leftOut].find((p) => p.startsWith(`${path}/`));
+		if (hit) return `Not staged: ${hit} is too large to send to the agent. Edit it by hand.`;
+	}
+	return null;
+}
+/**
+* The project the agent loop works on: `first` (mentioned and auto-context
+* paths) ahead of the rest, within the same limits as a request. A file that
+* does not fit is left out whole, never cut: a cut file reads as complete and
+* runs as broken.
+*/
+function pickLoopFiles(files, first, maxChars = MAX_AGENT_TOTAL_CHARS) {
+	const rank = /* @__PURE__ */ new Map();
+	first.forEach((path, i) => {
+		if (!rank.has(path)) rank.set(path, i);
+	});
+	const ordered = [...files.filter((f) => rank.has(f.path)).sort((a, b) => rank.get(a.path) - rank.get(b.path)), ...files.filter((f) => !rank.has(f.path))];
+	const map = {};
+	let used = 0;
+	let count = 0;
+	for (const file of ordered) {
+		if (count >= 160) break;
+		if (used + file.content.length > maxChars) continue;
+		map[file.path] = file.content;
+		used += file.content.length;
+		count += 1;
+	}
+	return map;
+}
+//#endregion
 //#region src/lib/agent/apply-edit.ts
 function applySearchReplace(content, search, replace) {
 	if (!search) return {
@@ -154756,9 +154964,38 @@ function applySearchReplace(content, search, replace) {
 		next: content.slice(0, first) + replace + content.slice(first + search.length)
 	};
 }
+/** Past this many line pairs the changed middle is shown removed then added, not matched line by line. */
+const MAX_DIFF_CELLS = 4e6;
 function lineDiff(oldText, newText) {
 	const a = oldText.split("\n");
 	const b = newText.split("\n");
+	let head = 0;
+	while (head < a.length && head < b.length && a[head] === b[head]) head += 1;
+	let tail = 0;
+	while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail += 1;
+	const out = a.slice(0, head).map((text) => ({
+		type: "eq",
+		text
+	}));
+	const midA = a.slice(head, a.length - tail);
+	const midB = b.slice(head, b.length - tail);
+	if (midA.length * midB.length > MAX_DIFF_CELLS) {
+		for (const text of midA) out.push({
+			type: "del",
+			text
+		});
+		for (const text of midB) out.push({
+			type: "add",
+			text
+		});
+	} else out.push(...middleDiff(midA, midB));
+	for (const text of a.slice(a.length - tail)) out.push({
+		type: "eq",
+		text
+	});
+	return out;
+}
+function middleDiff(a, b) {
 	const n = a.length;
 	const m = b.length;
 	const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
@@ -154856,77 +155093,6 @@ function diffBlock(oldText, newText) {
 		if (prev !== "eq" || next !== "eq") shown.push(` ${line.text}`);
 	}
 	return shown.join("\n");
-}
-//#endregion
-//#region src/lib/security/redact.ts
-/** Shared guards: secret-looking paths and tokens never go to Composer. */
-const SKIP_SECRET_FILES = /* @__PURE__ */ new Set([
-	".env",
-	".env.local",
-	".env.production",
-	".env.development",
-	".env.staging",
-	".netrc",
-	".npmrc",
-	".pypirc",
-	"id_rsa",
-	"id_dsa",
-	"id_ecdsa",
-	"id_ed25519",
-	"credentials.json",
-	"service-account.json",
-	".bash_history",
-	".zsh_history",
-	"wallet.dat"
-]);
-const SKIP_SECRET_EXT = /* @__PURE__ */ new Set([
-	"pem",
-	"p12",
-	"pfx",
-	"key",
-	"kdbx",
-	"jks",
-	"keystore",
-	"ovpn"
-]);
-const SECRET_LINE = /(?:api[_-]?key|auth(?:orization|token)?|secret|passwd|password|private[_-]?key|access[_-]?token|client[_-]?secret|npm[_-]?token)\s*[:=]\s*\S+/gi;
-const KEY_LIKE = /\b(sk-[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]{16,}|sk-proj-[A-Za-z0-9_-]{16,}|xai-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|Bearer\s+[A-Za-z0-9\-._~+/]+=*)\b/g;
-const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
-function safeRelPath(path) {
-	const n = path.replace(/\\/g, "/").replace(/^\//, "").replace(/\0/g, "");
-	if (!n || n.length > 240) return null;
-	const parts = n.split("/").filter((p) => p && p !== ".");
-	if (parts.length === 0) return null;
-	if (parts.some((p) => p === ".." || p === "~")) return null;
-	return parts.join("/");
-}
-function isSecretPath(path) {
-	const safe = safeRelPath(path);
-	if (!safe) return true;
-	const base = (safe.split("/").pop() ?? safe).toLowerCase();
-	if (SKIP_SECRET_FILES.has(base)) return true;
-	if (base.startsWith(".env") && base !== ".env.example") return true;
-	if (base.includes("service-account") && base.endsWith(".json")) return true;
-	const dot = base.lastIndexOf(".");
-	const ext = dot >= 0 ? base.slice(dot + 1) : "";
-	return SKIP_SECRET_EXT.has(ext);
-}
-function redactSecrets(text) {
-	if (!text) return text;
-	return text.replace(PEM_BLOCK, "[redacted private key]").replace(SECRET_LINE, (full) => {
-		const cut = full.search(/[:=]/);
-		if (cut < 0) return "[redacted]";
-		return `${full.slice(0, cut + 1)} [redacted]`;
-	}).replace(KEY_LIKE, "[redacted]");
-}
-function sanitizeFileMap(files) {
-	const out = {};
-	for (const [path, content] of Object.entries(files)) {
-		const safe = safeRelPath(path);
-		if (!safe || isSecretPath(safe)) continue;
-		out[safe] = redactSecrets(typeof content === "string" ? content : "");
-	}
-	return out;
 }
 //#endregion
 //#region src/lib/workspace/ts-service.ts
@@ -155268,7 +155434,7 @@ function createTsService(ts) {
 		},
 		fileRenameEdits(from, to) {
 			const name = `/${from}`;
-			if (!texts.has(name)) return null;
+			if (!texts.has(name) && ![...texts.keys()].some((path) => path.startsWith(`${name}/`))) return null;
 			let found;
 			try {
 				found = service.getEditsForFileRename(name, `/${to}`, format, preferences);
@@ -155507,6 +155673,35 @@ function moveTarget(files, from, typed) {
 	if (isSecretPath(to)) return { error: "Aperture does not keep secret files such as .env." };
 	if (files[to] !== void 0) return { error: `${to} already exists.` };
 	return { to };
+}
+/** The files under `folder`. */
+function filesIn(files, folder) {
+	return Object.keys(files).filter((path) => path.startsWith(`${folder}/`));
+}
+/** Where the folder `from` goes for the path typed; null when it stays where it is. */
+function folderTarget(files, from, typed) {
+	const raw = typed.trim().replace(/\/+$/, "");
+	if (!raw) return { error: "Give the folder a path." };
+	const to = safeRelPath(raw);
+	if (!to) return { error: "That path is outside the workspace." };
+	if (to === from) return null;
+	if (!filesIn(files, from).length) return { error: `${from} has no files any more.` };
+	if (to.startsWith(`${from}/`)) return { error: "A folder cannot move into itself." };
+	if (files[to] !== void 0 || filesIn(files, to).length) return { error: `${to} already exists.` };
+	return { to };
+}
+/**
+* What moving the folder `from` to `to` writes, by the paths after it: every
+* file under it at its new path, with TypeScript's edits to them and to the
+* files that import them. Null when an edit no longer fits.
+*/
+function movedFolderTexts(basis, from, to, changes) {
+	const changed = applyFileChanges(basis, changes);
+	if (!changed) return null;
+	const out = {};
+	for (const [path, text] of Object.entries(changed)) if (!path.startsWith(`${from}/`)) out[path] = text;
+	for (const path of filesIn(basis, from)) out[`${to}${path.slice(from.length)}`] = changed[path] ?? basis[path];
+	return out;
 }
 /**
 * The files the move writes, by their paths after it: the importers with
@@ -155814,17 +156009,17 @@ const AGENT_TOOLS = [
 		type: "function",
 		function: {
 			name: "move_file",
-			description: "Move or rename a file, as the editor's file tree does, and stage the move: the file under its new path and the old path removed. For TypeScript the compiler also updates every import of it and its own relative imports, so do not fix those by hand. Same locks and confidence rule as propose_edit.",
+			description: "Move or rename a file or a folder, as the editor's file tree does, and stage the move: each file under its new path and the old paths removed. For TypeScript the compiler also updates every import of it, and its own relative imports (for a folder, the imports into and out of it), so do not fix those by hand. Same locks and confidence rule as propose_edit.",
 			parameters: {
 				type: "object",
 				properties: {
 					from: {
 						type: "string",
-						description: "The file's path now."
+						description: "The file's or folder's path now."
 					},
 					to: {
 						type: "string",
-						description: "Its new path, file name included."
+						description: "Its new path: for a file, file name included."
 					},
 					confidence: {
 						type: "number",
@@ -156120,15 +156315,22 @@ async function executeTool(name, args, ctx) {
 		const from = safeRelPath(String(args.from ?? "")) ?? "";
 		const typed = String(args.to ?? "");
 		if (!from || !typed.trim()) return "move_file needs from and to.";
-		const target = moveTarget(ctx.files, from, typed);
+		const tooLarge = leftOutRefusal(ctx.leftOut, from, safeRelPath(typed) ?? "");
+		if (tooLarge) return tooLarge;
+		const folder = ctx.files[from] === void 0 && filesIn(ctx.files, from).length > 0;
+		const target = folder ? folderTarget(ctx.files, from, typed) : moveTarget(ctx.files, from, typed);
 		if (!target) return `${from} is already at that path.`;
 		if ("error" in target) return `Move not staged: ${target.error}`;
 		const { to } = target;
-		if (from === ".aperture/lessons.md" || to === ".aperture/lessons.md") return "The lessons file stays where it is.";
+		const moving = folder ? filesIn(ctx.files, from) : [from];
+		if (moving.length > 40) return `Move not staged: ${from} has ${moving.length} files; move at most 40 at once.`;
+		const newPath = (path) => folder ? `${to}${path.slice(from.length)}` : to;
+		if (moving.includes(".aperture/lessons.md") || moving.map(newPath).includes(".aperture/lessons.md")) return "The lessons file stays where it is.";
 		let basis = ctx.files;
-		let changed = { [to]: ctx.files[from] };
+		let changed = Object.fromEntries(moving.map((path) => [newPath(path), ctx.files[path]]));
 		let unchecked = "";
-		if (isTsPath(from)) {
+		const typescript = moving.some(isTsPath);
+		if (typescript) {
 			const found = ctx.intel ? await ctx.intel({
 				kind: "move",
 				from,
@@ -156148,28 +156350,32 @@ async function executeTool(name, args, ctx) {
 			status: "pending",
 			...edit
 		});
-		stage({
-			path: from,
-			oldText: basis[from],
+		const arrived = new Set(moving.map(newPath));
+		for (const path of moving) stage({
+			path,
+			oldText: basis[path],
 			newText: "",
 			deleted: true
 		});
 		for (const path of Object.keys(changed).sort()) stage({
 			path,
-			oldText: path === to ? "" : basis[path],
+			oldText: arrived.has(path) ? "" : basis[path],
 			newText: changed[path]
 		});
-		delete ctx.files[from];
+		for (const path of moving) delete ctx.files[path];
 		Object.assign(ctx.files, changed);
-		const importers = Object.keys(changed).filter((path) => path !== to);
+		const importers = Object.keys(changed).filter((path) => !arrived.has(path));
 		const fixed = importers.length ? ` Imports updated in ${importers.length} ${importers.length === 1 ? "file" : "files"} (${importers.slice(0, 6).join(", ")}${importers.length > 6 ? ", …" : ""}).` : "";
-		return `Edit staged: ${from} moved to ${to}.${unchecked ? ` Imports were not updated: ${unchecked} grep for ${from} and fix them with propose_edit.` : isTsPath(from) ? fixed || " Nothing imported it." : ` Not a TypeScript file, so nothing was updated to point at it: grep for ${from} if something refers to it.`}`;
+		const note = unchecked ? ` Imports were not updated: ${unchecked} grep for ${from} and fix them with propose_edit.` : typescript ? fixed || " Nothing imported it." : ` Not TypeScript, so nothing was updated to point at it: grep for ${from} if something refers to it.`;
+		return `Edit staged: ${from} moved to ${to}${folder ? ` (${moving.length} ${moving.length === 1 ? "file" : "files"})` : ""}.${note}`;
 	}
 	if (name === "delete_file") {
 		const locked = editLock(ctx);
 		if (locked) return locked;
 		if (!keepEdit(parseConfidence(args.confidence))) return "Edit dropped. Confidence is below 0.8, so nothing was staged.";
 		const path = safeRelPath(String(args.path ?? "")) ?? "";
+		const tooLarge = leftOutRefusal(ctx.leftOut, path);
+		if (tooLarge) return tooLarge;
 		const current = ctx.files[path];
 		if (!path || current === void 0) return `File not found: ${path}`;
 		if (path === ".aperture/lessons.md") return "The lessons file stays; edit it with propose_edit instead.";
@@ -156193,6 +156399,8 @@ async function executeTool(name, args, ctx) {
 		if (locked) return locked;
 		if (!keepEdit(parseConfidence(args.confidence))) return "Edit dropped. Confidence is below 0.8, so nothing was staged.";
 		const path = safeRelPath(String(args.path ?? "")) ?? "";
+		const tooLarge = leftOutRefusal(ctx.leftOut, path);
+		if (tooLarge) return tooLarge;
 		const search = String(args.search ?? "");
 		const replace = String(args.replace ?? "");
 		const description = String(args.description ?? "Update file");
@@ -158058,9 +158266,27 @@ function planRename(service, files, path, name, next, line) {
 /**
 * What moving `from` to `to` writes, by the paths after the move: the moved
 * file under `to` with its own relative imports fixed, and every file that
-* imported it, as the file tree's Rename does (`movedTexts`).
+* imported it, as the file tree's Rename does (`movedTexts`). `from` may be a
+* folder: then every file under it, with the imports into and out of it
+* (`movedFolderTexts`), as the tree's folder Rename does.
 */
 function planMove(service, files, from, to) {
+	if (files[from] === void 0 && filesIn(files, from).length) {
+		const changes = service.fileRenameEdits(from, to);
+		if (!changes) return {
+			ok: false,
+			reason: `TypeScript cannot work out the imports of ${from}.`
+		};
+		const changed = movedFolderTexts(files, from, to, changes);
+		if (!changed) return {
+			ok: false,
+			reason: `${from} changed while moving. Try again.`
+		};
+		return {
+			ok: true,
+			changed
+		};
+	}
 	if (files[from] === void 0) return {
 		ok: false,
 		reason: `File not found: ${from}`
@@ -158360,12 +158586,34 @@ function fixPrompt(script, output) {
 		"Fix this now with propose_edit. Change only what the failure requires — do not restart the plan or widen the scope. If the failure is unrelated to your edits, say so plainly instead of editing."
 	].join("\n");
 }
+/** Kept back from a sandbox run's timeout for the step that reads its result. */
+const RUN_MARGIN_MS = 1e4;
+/** Milliseconds left before `deadline`, or null for a turn with no deadline (one run in the browser). */
+function timeLeft(deadline, now = Date.now()) {
+	return deadline == null ? null : deadline - now;
+}
+/**
+* The longest a sandbox run may take now: null for no limit beyond the run's
+* own, 0 when there is not enough time to start one.
+*/
+function runAllowance(deadline, now = Date.now()) {
+	const left = timeLeft(deadline, now);
+	if (left === null) return null;
+	return left < 3e4 ? 0 : left - RUN_MARGIN_MS;
+}
+/** What the agent reads when a run would not finish before the turn ends. */
+function noTimeToRunText(script) {
+	return `Not run: this turn is close to its time limit. Stage the change now; npm run ${script} can run in the next turn.`;
+}
+/** How a turn that reached its time limit ends. */
+function outOfTimeText(staged) {
+	return staged > 0 ? "Stopped at this turn's time limit. Review the staged edits, or say \"continue\" to carry on." : "Stopped at this turn's time limit before anything was staged. Say \"continue\" to carry on.";
+}
 //#endregion
 //#region src/lib/agent/loop.ts
 const MAX_PLAN_STEPS = 8;
 const MAX_BUILD_STEPS = 12;
-const MAX_FILES = 120;
-const MAX_CHARS$1 = 22e4;
+const SEARCH_INDEX_CHARS = 22e4;
 function flavorOf(input) {
 	const id = input.agentId;
 	if (!id) return null;
@@ -158390,20 +158638,6 @@ function systemPrompt(mode, rules, flavorKind, phase, role) {
 	].filter(Boolean).join(" ");
 	if (!rules) return base;
 	return `${base}\n\nProject rules (follow these):\n${rules.slice(0, 6e3)}`;
-}
-function capFiles(files, mentioned) {
-	const map = {};
-	let used = 0;
-	const mentionSet = new Set(mentioned);
-	const ordered = [...files.filter((f) => mentionSet.has(f.path)), ...files.filter((f) => !mentionSet.has(f.path))];
-	for (const file of ordered.slice(0, MAX_FILES)) {
-		const room = MAX_CHARS$1 - used;
-		if (room <= 0) break;
-		const content = file.content.length > room ? file.content.slice(0, room) : file.content;
-		map[file.path] = content;
-		used += content.length;
-	}
-	return map;
 }
 function fileTree(files) {
 	return Object.keys(files).sort().map((p) => `- ${p} (${files[p].split("\n").length} lines)`).join("\n");
@@ -158446,7 +158680,7 @@ function mergeEdits(edits) {
 	}
 	return [...byPath.values()];
 }
-function buildContextMessage(input, files, chunks) {
+function buildContextMessage(input, files, chunks, leftOut = []) {
 	const mentioned = parseMentions(input.instruction, files);
 	const extra = expandMentions(mentioned, files);
 	const auto = (input.focusPaths?.length ? input.focusPaths : autoContextPaths({
@@ -158457,6 +158691,7 @@ function buildContextMessage(input, files, chunks) {
 	})).filter((path) => files[path] !== void 0 && !mentioned.includes(path));
 	const parts = [
 		`Workspace files:\n${fileTree(files)}`,
+		leftOut.length ? `Too large to include (do not create, edit, move or delete these): ${leftOut.slice(0, 50).join(", ")}${leftOut.length > 50 ? ", …" : ""}` : "",
 		`Repo map:\n${repoMap(files) || "(no symbols)"}`,
 		input.activePath ? `Active file: ${input.activePath}` : "",
 		input.selection ? `Selection in ${input.selection.path} L${input.selection.fromLine}-L${input.selection.toLine}:\n${input.selection.text}` : "",
@@ -158491,11 +158726,14 @@ async function runLoop(input, cfg, emit, signal, host) {
 		mentioned,
 		extra: isUiTask(input.instruction) ? nearestUiFiles(fileMap, input.instruction, input.activePath ?? null, 3) : []
 	});
-	const files = reviewing ? {} : capFiles(Object.entries(fileMap).map(([path, content]) => ({
+	const entries = Object.entries(fileMap).map(([path, content]) => ({
 		path,
 		content
-	})), [...mentioned, ...auto]);
-	const chunks = reviewing ? [] : indexFiles(files);
+	}));
+	const first = [...mentioned, ...auto];
+	const files = reviewing ? {} : pickLoopFiles(entries, first);
+	const leftOut = reviewing ? [] : [.../* @__PURE__ */ new Set([...input.leftOut ?? [], ...entries.map((e) => e.path).filter((path) => files[path] === void 0)])];
+	const chunks = reviewing ? [] : indexFiles(pickLoopFiles(entries, first, SEARCH_INDEX_CHARS));
 	const phase = resolveAgentPhase(input.mode, input.phase);
 	const requirePlan = (input.mode === "composer" || Boolean(flavor)) && phase !== "skip";
 	const approved = input.approvedPlan?.length ? input.approvedPlan : [];
@@ -158505,6 +158743,10 @@ async function runLoop(input, cfg, emit, signal, host) {
 	let lastRun;
 	/** run_script calls made before any edit. Two of those end the turn instead of spending it. */
 	let scriptsWithoutEdits = 0;
+	const deadline = cfg.deadline ?? null;
+	const timeUp = new AbortController();
+	const timer = deadline === null ? null : setTimeout(() => timeUp.abort(), Math.max(0, deadline - Date.now()));
+	const stepSignal = deadline === null ? signal : signal ? AbortSignal.any([signal, timeUp.signal]) : timeUp.signal;
 	const editsKeyOf = (edits) => JSON.stringify(mergeEdits(edits).map((e) => [e.path, e.newText]));
 	const reviewTally = {
 		kept: 0,
@@ -158552,8 +158794,21 @@ async function runLoop(input, cfg, emit, signal, host) {
 		mode: input.mode,
 		role: input.role,
 		reviewTally,
+		leftOut: new Set(leftOut),
 		runScript: cfg.userId && host.runScript ? async (script) => {
-			const result = await host.runScript(cfg.userId, ctx.files, script, signal);
+			const allowed = runAllowance(deadline);
+			if (allowed === 0) {
+				emit({
+					type: "status",
+					text: `Could not run ${script}`
+				});
+				return {
+					text: noTimeToRunText(script),
+					passed: false,
+					ran: false
+				};
+			}
+			const result = await host.runScript(cfg.userId, ctx.files, script, stepSignal, allowed ?? void 0);
 			emit({
 				type: "status",
 				text: !result.ran ? `Could not run ${script}` : result.passed ? `Ran ${script} · passed` : `Ran ${script} · failed`
@@ -158606,7 +158861,10 @@ async function runLoop(input, cfg, emit, signal, host) {
 	} catch {}
 	const traces = [];
 	const rules = findRules(fileMap)?.text ?? null;
-	if (input.mode === "inline") return runInline(cfg, input, files, signal, host);
+	if (input.mode === "inline") {
+		if (timer) clearTimeout(timer);
+		return runInline(cfg, input, files, signal, host);
+	}
 	if (flavor) emit({
 		type: "status",
 		text: `ACP session/new · ${flavor.name}`
@@ -158639,7 +158897,12 @@ async function runLoop(input, cfg, emit, signal, host) {
 		refused ? `The user already refused these. Do not propose them again:\n${refused}` : "",
 		here
 	].filter(Boolean).join("\n\n");
-	const userCtx = reviewing ? [reviewContext(ctx.edits), input.userMove ?? ""].filter(Boolean).join("\n\n") : [buildContextMessage(input, files, chunks), mcpNote].filter(Boolean).join("\n\n");
+	const shownEdits = ctx.edits.map((edit) => ({
+		...edit,
+		oldText: redactSecrets(edit.oldText, edit.path),
+		newText: redactSecrets(edit.newText, edit.path)
+	}));
+	const userCtx = reviewing ? [reviewContext(shownEdits), input.userMove ?? ""].filter(Boolean).join("\n\n") : [buildContextMessage(input, files, chunks, leftOut), mcpNote].filter(Boolean).join("\n\n");
 	let messages = [{
 		role: "system",
 		content: sys,
@@ -158699,12 +158962,30 @@ async function runLoop(input, cfg, emit, signal, host) {
 			...extra
 		};
 	};
+	/** Steps started so far, for the debug panel when the turn ends early. */
+	let stepsTaken = 0;
+	/** Ends a turn cut short by the step limit or the time limit, keeping what it staged. */
+	const stopEarly = async (why, steps) => {
+		const staged = mergeEdits(ctx.edits);
+		const awaitingBuild = phase === "plan" && ctx.plan.length > 0;
+		const text = awaitingBuild ? planReadyText(void 0) : why === "time" ? outOfTimeText(staged.length) : staged.length > 0 ? "Stopped after the tool-call limit. Review the staged edits." : "Stopped after the tool-call limit. Nothing was staged.";
+		return await succeed({
+			text,
+			traces,
+			edits: awaitingBuild ? [] : staged,
+			plan: ctx.plan,
+			awaitingBuild
+		}, steps);
+	};
 	try {
 		for (let step = 0; step < maxSteps; step++) {
 			if (signal?.aborted) return {
 				ok: false,
 				error: "Stopped."
 			};
+			const left = timeLeft(deadline);
+			if (left !== null && left < 2e4) return await stopEarly("time", step);
+			stepsTaken = step + 1;
 			const hasPlan = ctx.plan.length > 0;
 			const kind = input.role === "review" ? "review" : toolKindFor(input.mode, phase);
 			emit({
@@ -158715,7 +158996,7 @@ async function runLoop(input, cfg, emit, signal, host) {
 			const completion = await host.completeStreaming(cfg, messages, true, (delta) => emit({
 				type: "text",
 				delta
-			}), signal, toolsForStep(kind));
+			}), stepSignal, toolsForStep(kind));
 			const calls = completion.tool_calls ?? [];
 			const callNames = calls.map((c) => c.function.name);
 			if (calls.length === 0) {
@@ -158912,21 +159193,13 @@ async function runLoop(input, cfg, emit, signal, host) {
 				awaitingBuild: true
 			}, step + 1);
 		}
-		const staged = mergeEdits(ctx.edits);
-		const text = phase === "plan" && ctx.plan.length > 0 ? planReadyText(void 0) : staged.length > 0 ? "Stopped after the tool-call limit. Review the staged edits." : "Stopped after the tool-call limit. Nothing was staged.";
-		const awaitingBuild = phase === "plan" && ctx.plan.length > 0;
-		return await succeed({
-			text,
-			traces,
-			edits: awaitingBuild ? [] : staged,
-			plan: ctx.plan,
-			awaitingBuild
-		}, maxSteps);
+		return await stopEarly("steps", maxSteps);
 	} catch (error) {
 		if (signal?.aborted) return {
 			ok: false,
 			error: "Stopped."
 		};
+		if (timeUp.signal.aborted) return await stopEarly("time", stepsTaken);
 		const message = error instanceof Error ? error.message : "Agent failed";
 		emit({
 			type: "error",
@@ -158936,6 +159209,8 @@ async function runLoop(input, cfg, emit, signal, host) {
 			ok: false,
 			error: message
 		};
+	} finally {
+		if (timer) clearTimeout(timer);
 	}
 }
 async function runInline(cfg, input, files, signal, host) {
@@ -159847,7 +160122,7 @@ function nextMessages(input) {
 	}];
 }
 /** The suggestions in a reply: list lines only, cleaned, unique, at most a few. */
-function parseNext(text) {
+function parseNext(text, max = 3) {
 	const out = [];
 	for (const line of text.split("\n")) {
 		const match = /^\s*(?:[-*•]|\d+[.)])\s+(.+)$/.exec(line);
@@ -159856,7 +160131,7 @@ function parseNext(text) {
 		if (!task || /^none\.?$/i.test(task)) continue;
 		const clipped = task.length > MAX_CHARS ? `${task.slice(0, 239)}…` : task;
 		if (!out.some((t) => t.toLowerCase() === clipped.toLowerCase())) out.push(clipped);
-		if (out.length === 3) break;
+		if (out.length === max) break;
 	}
 	return out;
 }
@@ -160327,6 +160602,18 @@ Object.defineProperty(exports, "git", {
 		return git;
 	}
 });
+Object.defineProperty(exports, "instructionFor", {
+	enumerable: true,
+	get: function() {
+		return instructionFor;
+	}
+});
+Object.defineProperty(exports, "loadWorkingFiles", {
+	enumerable: true,
+	get: function() {
+		return loadWorkingFiles;
+	}
+});
 Object.defineProperty(exports, "parseNext", {
 	enumerable: true,
 	get: function() {
@@ -160343,6 +160630,12 @@ Object.defineProperty(exports, "retryStale", {
 	enumerable: true,
 	get: function() {
 		return retryStale;
+	}
+});
+Object.defineProperty(exports, "runLoop", {
+	enumerable: true,
+	get: function() {
+		return runLoop;
 	}
 });
 Object.defineProperty(exports, "runTask", {

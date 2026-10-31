@@ -4,7 +4,7 @@
 // local stand-in for an OpenAI-compatible endpoint that plans, proposes edits
 // and reports token usage, so no key is needed. The Action's part needs Docker.
 //
-//   node test/smoke.mjs dist/index.cjs
+//   node packages/aperture-bot/smoke.mjs [path/to/index.cjs]
 import { execFile, execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -46,9 +46,11 @@ const call = (name, args, id) => ({
   function: { name, arguments: JSON.stringify(args) },
 });
 
-/** Plans three steps, then proposes `edit` on every build turn. */
+/** Plans three steps, proposes `edit` on every build turn, then suggests what is next. */
 function model(edit) {
   return (body) => {
+    if (/might want done next/.test(body.messages[0]?.content ?? ""))
+      return { content: "- Use formatPrice in src/cart.ts too" };
     const names = (body.tools ?? []).map((t) => t.function.name);
     const thisTurn = body.messages.filter((m) => m.role === "assistant" && m.tool_calls?.length);
     if (!names.includes("propose_edit")) {
@@ -147,8 +149,13 @@ expect(
   clear.stdout,
 );
 expect(
-  /Used 2,000 input and 100 output tokens in 2 model calls\./.test(clear.stdout),
+  /Used 3,000 input and 150 output tokens in 3 model calls\./.test(clear.stdout),
   "it reports the tokens the endpoint billed",
+  clear.stdout,
+);
+expect(
+  /Next, I would suggest:\n- Use formatPrice in src\/cart\.ts too/.test(clear.stdout),
+  "it ends with what it would do next",
   clear.stdout,
 );
 
@@ -186,7 +193,8 @@ const github = createServer((req, res) => {
   req.on("data", (chunk) => (raw += chunk));
   req.on("end", () => {
     const path = new URL(req.url, "http://x").pathname;
-    if (req.method === "POST") posted.push({ path, body: JSON.parse(raw || "{}") });
+    if (req.method === "POST" || req.method === "PATCH")
+      posted.push({ method: req.method, path, body: JSON.parse(raw || "{}") });
     res.setHeader("content-type", "application/json");
     if (path.endsWith("/permission")) return res.end(JSON.stringify({ role_name: "admin" }));
     if (req.method === "GET" && path.endsWith("/comments")) return res.end("[]");
@@ -194,7 +202,7 @@ const github = createServer((req, res) => {
       return res.end(
         JSON.stringify({ number: 8, html_url: "https://github.com/acme/shop/pull/8" }),
       );
-    res.end(JSON.stringify({ html_url: "https://github.com/acme/shop/issues/7#reply" }));
+    res.end(JSON.stringify({ id: 900, html_url: "https://github.com/acme/shop/issues/7#reply" }));
   });
 });
 await new Promise((done) => github.listen(0, "127.0.0.1", done));
@@ -235,10 +243,18 @@ const acted = await node([actionBundle], {
 github.close();
 modelForAction.close();
 const pr = posted.find((p) => p.path.endsWith("/pulls"));
+const lastWord = posted.filter((p) => /\/issues\/(7\/comments|comments\/900)$/.test(p.path)).at(-1);
 expect(
   acted.code === 0 && pr,
   "the Action opens a pull request for a clear change",
   acted.stdout + acted.stderr,
+);
+expect(
+  lastWord?.method === "PATCH" &&
+    /^Opened https:\/\/github\.com\/acme\/shop\/pull\/8/.test(lastWord.body.body) &&
+    /<!-- aperture-bot \{"v":1,"state":"clear","asked":5,/.test(lastWord.body.body),
+  "the bot's comment ends as the reply, with its summary for the Bot page",
+  JSON.stringify(lastWord),
 );
 expect(
   gitIn(
@@ -261,6 +277,82 @@ expect(
   readFileSync(join(root, "output.txt"), "utf8").startsWith("outcome=clear\n"),
   "the Action's outcome is clear",
   readFileSync(join(root, "output.txt"), "utf8"),
+);
+
+// A push to the bot's pull request, with the "check every pull request" job:
+// Agent Check alone, on a one-commit-deep checkout as actions/checkout makes,
+// with the tests in the sandbox and no model key at all.
+const checked = [];
+const github2 = createServer((req, res) => {
+  let raw = "";
+  req.on("data", (chunk) => (raw += chunk));
+  req.on("end", () => {
+    const path = new URL(req.url, "http://x").pathname;
+    if (req.method === "POST" || req.method === "PATCH")
+      checked.push({ method: req.method, path, body: JSON.parse(raw || "{}") });
+    res.setHeader("content-type", "application/json");
+    if (path.endsWith("/permission")) return res.end(JSON.stringify({ role_name: "admin" }));
+    if (req.method === "GET" && path.endsWith("/comments")) return res.end("[]");
+    if (req.method === "GET" && path.endsWith("/pulls/8"))
+      return res.end(
+        JSON.stringify({
+          number: 8,
+          head: {
+            ref: "aperture/7-show-prices-in-dollars",
+            sha: "x",
+            repo: { full_name: "acme/shop" },
+          },
+          base: { ref: "main" },
+        }),
+      );
+    res.end(JSON.stringify({ id: 901, html_url: "https://github.com/acme/shop/pull/8#check" }));
+  });
+});
+await new Promise((done) => github2.listen(0, "127.0.0.1", done));
+gitIn(root, "clone", "-q", "--depth", "1", `file://${join(root, "origin.git")}`, "ws2");
+writeFileSync(
+  join(root, "push.json"),
+  JSON.stringify({
+    action: "synchronize",
+    sender: { login: "owner", type: "User" },
+    pull_request: { number: 8, title: "Show prices in dollars", body: "", draft: false },
+    repository: { name: "shop", owner: { login: "acme" }, default_branch: "main" },
+  }),
+);
+writeFileSync(join(root, "output2.txt"), "");
+const check = await node([actionBundle], {
+  PATH: process.env.PATH,
+  HOME: process.env.HOME,
+  GITHUB_EVENT_NAME: "pull_request",
+  GITHUB_EVENT_PATH: join(root, "push.json"),
+  GITHUB_WORKSPACE: join(root, "ws2"),
+  GITHUB_OUTPUT: join(root, "output2.txt"),
+  GITHUB_API_URL: `http://127.0.0.1:${github2.address().port}`,
+  "INPUT_GITHUB-TOKEN": "smoke-github-token",
+  INPUT_INSTALL: "none",
+});
+github2.close();
+const report = checked.filter((p) => /\/issues\/(8\/comments|comments\/901)$/.test(p.path)).at(-1);
+expect(
+  check.code === 0 &&
+    /^### Aperture Agent Check\n\nNothing red on 1 changed file\./.test(report?.body.body ?? "") &&
+    /<!-- aperture-bot \{"v":1,"state":"clear","kind":"check","asked":0,"run":"[^"]*","via":"pull"/.test(
+      report?.body.body ?? "",
+    ),
+  "a push to a pull request is checked against its base, from a shallow checkout",
+  check.stdout + check.stderr + JSON.stringify(report),
+);
+expect(
+  /\| ✓ \| Tests pass \| npm run test passed in a container with no network\. \|/.test(
+    report.body.body,
+  ) && !checked.some((p) => p.path.endsWith("/pulls")),
+  "the check ran the tests in the sandbox, with no model key, and changed nothing",
+  report.body.body,
+);
+expect(
+  readFileSync(join(root, "output2.txt"), "utf8") === "outcome=clear\nverdict=clear\n",
+  "the check's verdict is an output",
+  readFileSync(join(root, "output2.txt"), "utf8"),
 );
 
 console.log("\nThe bundle works.");
