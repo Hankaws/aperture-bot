@@ -818,6 +818,13 @@ var GitHub = class {
 		});
 		return threads;
 	}
+	/**
+	* The bot's pull requests (`aperture/…` branches) closed without merging
+	* since then: their titles, the work the maintainer turned down.
+	*/
+	async closedUnmerged(since) {
+		return (await this.all(`${this.base}/pulls?state=closed&sort=updated&direction=desc`, 2)).filter((p) => (p.head?.ref ?? "").startsWith("aperture/") && !p.merged_at && (p.closed_at ?? "") >= since).map((p) => p.title ?? "").filter(Boolean);
+	}
 	/** Open pull requests: their branch and page, and what the look-over reads. */
 	async openPulls() {
 		return (await this.all(`${this.base}/pulls?state=open`)).map((p) => ({
@@ -914,7 +921,7 @@ function threads(list, now) {
 * things stand, and up to five ideas from the code itself. The repository's
 * state and its TODO lines go in as data.
 */
-function briefQuestion(view, todos) {
+function briefQuestion(view, todos, declined = []) {
 	return {
 		question: [
 			"This is your daily brief on this repository. Look through its code with your tools, and the state below.",
@@ -930,9 +937,38 @@ function briefQuestion(view, todos) {
 			`Open pull requests:\n${threads(view.pulls, view.now)}`,
 			"</github>",
 			"",
-			todos.length ? `TODO lines in the code:\n${todos.slice(0, MAX_TODOS).join("\n")}` : "No TODO lines in the code."
+			todos.length ? `TODO lines in the code:\n${todos.slice(0, MAX_TODOS).join("\n")}` : "No TODO lines in the code.",
+			...declined.length ? ["", `The maintainer turned these ideas down lately. Never suggest them again, nor the same thing in other words:\n${declined.slice(0, MAX_DECLINED).map((d) => `- ${d}`).join("\n")}`] : []
 		].join("\n")
 	};
+}
+/** The declined ideas the brief is told of: the newest, so the context stays small. */
+const MAX_DECLINED = 30;
+const key = (text) => text.replace(/\u200b/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+/**
+* The ideas left once the declined ones are taken out: the model is told not
+* to offer them, and this makes sure. A pull request's title can be cut
+* (`…`), so a declined title that ends so matches the ideas it begins.
+*/
+function withoutDeclined(next, declined) {
+	const keys = declined.map(key).filter(Boolean);
+	return next.filter((idea) => {
+		const k = key(idea);
+		return !keys.some((d) => d === k || d.endsWith("…") && d.length > 20 && k.startsWith(d.slice(0, -1)));
+	});
+}
+//#endregion
+//#region src/lib/bot/struck.ts
+const STRUCK = /^(\s*[-*] )~~(.+?)~~ · dismissed$/;
+const flat = (text) => text.replace(/\s+/g, " ").trim();
+/** The ideas of `next` that a reply's body shows struck out. */
+function struckIdeas(body, next) {
+	const struck = /* @__PURE__ */ new Set();
+	for (const line of body.split("\n")) {
+		const match = STRUCK.exec(line.replace(/\r$/, ""));
+		if (match) struck.add(flat(match[2]));
+	}
+	return next.filter((task) => struck.has(flat(task)));
 }
 //#endregion
 //#region packages/aperture-bot/src/review.ts
@@ -1818,7 +1854,8 @@ function tasksFrom(comments, threads, options = {}) {
 				summary,
 				replyUrl: comment.html_url ?? null,
 				updatedAt: comment.updated_at ?? comment.created_at ?? "",
-				diff: unpushedDiff(comment.body ?? "")
+				diff: unpushedDiff(comment.body ?? ""),
+				struck: struckIdeas(comment.body ?? "", summary.next ?? [])
 			});
 			continue;
 		}
@@ -1861,7 +1898,8 @@ function tasksFrom(comments, threads, options = {}) {
 			summary: reply?.summary ?? null,
 			replyUrl: replyComment?.html_url ?? null,
 			updatedAt: replyComment?.updated_at ?? askedAt,
-			diff: reply ? unpushedDiff(reply.comment.body ?? "") : null
+			diff: reply ? unpushedDiff(reply.comment.body ?? "") : null,
+			struck: reply ? struckIdeas(reply.comment.body ?? "", reply.summary.next ?? []) : []
 		});
 	}
 	return tasks.sort((a, b) => a.askedAt < b.askedAt ? 1 : a.askedAt > b.askedAt ? -1 : 0);
@@ -2471,6 +2509,26 @@ async function runAction(env, deps = {}) {
 		waiting: null
 	};
 	/**
+	* What the maintainer turned down in the last 30 days, for the brief not to
+	* offer again: ideas struck out of the bot's replies (dismissed on the Bot
+	* page, `struck.ts`), and the bot's pull requests closed without merging.
+	* If GitHub cannot say, the brief goes on without it.
+	*/
+	const declinedIdeas = async (now) => {
+		const since = (/* @__PURE__ */ new Date(now - 2592e6)).toISOString();
+		try {
+			const [comments, closed] = await Promise.all([gh.commentsSince(since), gh.closedUnmerged(since)]);
+			const struck = comments.flatMap((c) => {
+				const s = c.authorType === "Bot" ? readSummary(c.body) : null;
+				return s?.next?.length ? struckIdeas(c.body, s.next) : [];
+			});
+			return [.../* @__PURE__ */ new Set([...struck, ...closed])];
+		} catch (error) {
+			log(`Aperture Bot: could not read what was turned down: ${require_run.describeError(error)}`);
+			return [];
+		}
+	};
+	/**
 	* On Mondays (UTC), the brief carries the week's digest: what the bot did in
 	* the last seven days, counted from its own summaries on GitHub as the Bot
 	* page counts them. No model call; if GitHub cannot say, the brief goes
@@ -2513,7 +2571,9 @@ async function runAction(env, deps = {}) {
 			now: deps.now?.() ?? Date.now()
 		};
 		log(`Aperture Bot: looking ${command.owner}/${command.repo} over`);
-		const brief = briefQuestion(view, todoLines(cwd));
+		const declined = await declinedIdeas(view.now);
+		if (declined.length) log(`Aperture Bot: leaving out ${declined.length} ideas turned down lately`);
+		const brief = briefQuestion(view, todoLines(cwd), declined);
 		const result = await answerQuestion({
 			cwd,
 			question: brief.question,
@@ -2525,7 +2585,7 @@ async function runAction(env, deps = {}) {
 		if (!result.ok) throw new Error(result.error);
 		const look = {
 			note: result.answer,
-			next: result.next
+			next: withoutDeclined(result.next, declined)
 		};
 		const waiting = pulls.find((p) => p.headRef.startsWith(`aperture/${command.number}-`));
 		briefed = {
