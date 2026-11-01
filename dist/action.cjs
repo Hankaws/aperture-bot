@@ -819,11 +819,16 @@ var GitHub = class {
 		return threads;
 	}
 	/**
-	* The bot's pull requests (`aperture/…` branches) closed without merging
-	* since then: their titles, the work the maintainer turned down.
+	* The bot's pull requests (`aperture/…` branches) closed since then, by
+	* title: those merged, the work the maintainer took, and those closed
+	* without merging, the work they turned down.
 	*/
-	async closedUnmerged(since) {
-		return (await this.all(`${this.base}/pulls?state=closed&sort=updated&direction=desc`, 2)).filter((p) => (p.head?.ref ?? "").startsWith("aperture/") && !p.merged_at && (p.closed_at ?? "") >= since).map((p) => p.title ?? "").filter(Boolean);
+	async closedBotPulls(since) {
+		const mine = (await this.all(`${this.base}/pulls?state=closed&sort=updated&direction=desc`, 2)).filter((p) => (p.head?.ref ?? "").startsWith("aperture/") && (p.closed_at ?? "") >= since && p.title);
+		return {
+			merged: mine.filter((p) => p.merged_at).map((p) => p.title),
+			unmerged: mine.filter((p) => !p.merged_at).map((p) => p.title)
+		};
 	}
 	/** Open pull requests: their branch and page, and what the look-over reads. */
 	async openPulls() {
@@ -863,6 +868,67 @@ const ZWSP = "​";
 /** The text with every @mention and HTML comment opener made inert. */
 function quiet(text) {
 	return text.replace(/(^|[^\w@`/.\u200b])@(?=[A-Za-z0-9])/g, `$1@${ZWSP}`).replace(/<!--/g, `<${ZWSP}!--`);
+}
+//#endregion
+//#region src/lib/bot/taste.ts
+/** In words, for the brief and the page: "tests", "bug fixes". */
+const KIND_WORDS = {
+	test: "tests",
+	fix: "bug fixes",
+	docs: "docs",
+	cleanup: "cleanups",
+	feature: "features"
+};
+/** The kind of work an idea or a pull request's title is, by its words; a test first, as "add a test for the fix" is. */
+function kindOf(text) {
+	const t = text.toLowerCase();
+	if (/\btests?\b|\bspec\b|\bcoverage\b/.test(t)) return "test";
+	if (/\b(fix|fixes|bug|crash|broken|wrong|red|fails?|failing|error|regression)\b/.test(t)) return "fix";
+	if (/\b(docs?|readme|comments?|changelog|jsdoc|documentation)\b/.test(t)) return "docs";
+	if (/\b(rename|refactor|extract|clean ?up|tidy|simplify|dedupe|remove unused|name the)\b/.test(t)) return "cleanup";
+	return "feature";
+}
+/** The taste of what was merged or asked for: kinds with at least one, most first. */
+function tasteOf(liked) {
+	const counts = /* @__PURE__ */ new Map();
+	for (const text of liked) {
+		const kind = kindOf(text);
+		counts.set(kind, (counts.get(kind) ?? 0) + 1);
+	}
+	return sortTaste(counts);
+}
+const ORDER = [
+	"test",
+	"fix",
+	"docs",
+	"cleanup",
+	"feature"
+];
+/** Most first; at a tie, in ORDER. */
+function sortTaste(counts) {
+	return [...counts.entries()].filter(([, count]) => count > 0).map(([kind, count]) => ({
+		kind,
+		count
+	})).sort((a, b) => b.count - a.count || ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind));
+}
+/** "Lately the maintainer merged or asked for mostly tests (4) and bug fixes (3)." Null when there is nothing to go on. */
+function tasteLine(taste) {
+	const top = taste.slice(0, 2).filter((t) => t.count > 0);
+	if (top.length === 0) return null;
+	return `Lately the maintainer merged or asked for mostly ${top.map((t) => `${KIND_WORDS[t.kind]} (${t.count})`).join(" and ")}.`;
+}
+/**
+* The ideas of a reply that someone ticked or said yes to: their box reads
+* "started by @someone". One the bot started on its own (`always-allow`) is
+* not counted: nobody chose it.
+*/
+function tickedIdeas(body, next) {
+	const started = /* @__PURE__ */ new Set();
+	for (const line of body.split("\n")) {
+		const match = /^\s*[-*] \[[xX]\] (.+?) · started by @/.exec(line.replace(/\r$/, ""));
+		if (match) started.add(match[1].replace(/\s+/g, " ").trim());
+	}
+	return next.filter((task) => started.has(task.replace(/\s+/g, " ").trim()));
 }
 const SHOWN = 5;
 const MAX_FAILING = 8;
@@ -921,7 +987,11 @@ function threads(list, now) {
 * things stand, and up to five ideas from the code itself. The repository's
 * state and its TODO lines go in as data.
 */
-function briefQuestion(view, todos, declined = []) {
+function briefQuestion(view, todos, declined = [], lately = {
+	taste: [],
+	liked: []
+}) {
+	const likes = tasteLine(lately.taste);
 	return {
 		question: [
 			"This is your daily brief on this repository. Look through its code with your tools, and the state below.",
@@ -938,12 +1008,15 @@ function briefQuestion(view, todos, declined = []) {
 			"</github>",
 			"",
 			todos.length ? `TODO lines in the code:\n${todos.slice(0, MAX_TODOS).join("\n")}` : "No TODO lines in the code.",
-			...declined.length ? ["", `The maintainer turned these ideas down lately. Never suggest them again, nor the same thing in other words:\n${declined.slice(0, MAX_DECLINED).map((d) => `- ${d}`).join("\n")}`] : []
+			...declined.length ? ["", `The maintainer turned these ideas down lately. Never suggest them again, nor the same thing in other words:\n${declined.slice(0, MAX_DECLINED).map((d) => `- ${d}`).join("\n")}`] : [],
+			...likes ? ["", `${likes} Put ideas like these first, when the code gives you some; never make one up to fit:\n${lately.liked.slice(0, MAX_LIKED).map((d) => `- ${d}`).join("\n")}`] : []
 		].join("\n")
 	};
 }
 /** The declined ideas the brief is told of: the newest, so the context stays small. */
 const MAX_DECLINED = 30;
+/** And the ideas taken lately, as examples of what is welcome. */
+const MAX_LIKED = 10;
 const key = (text) => text.replace(/\u200b/g, "").replace(/\s+/g, " ").trim().toLowerCase();
 /**
 * The ideas left once the declined ones are taken out: the model is told not
@@ -2509,23 +2582,37 @@ async function runAction(env, deps = {}) {
 		waiting: null
 	};
 	/**
-	* What the maintainer turned down in the last 30 days, for the brief not to
-	* offer again: ideas struck out of the bot's replies (dismissed on the Bot
-	* page, `struck.ts`), and the bot's pull requests closed without merging.
-	* If GitHub cannot say, the brief goes on without it.
+	* What the maintainer did with the bot's work in the last 30 days, for the
+	* brief. Declined, never to offer again: ideas struck out of the bot's
+	* replies (dismissed on the Bot page, `struck.ts`), and its pull requests
+	* closed without merging. Liked, to offer more like them (`taste.ts`): its
+	* pull requests merged, and ideas someone ticked or said yes to (not those
+	* an `always-allow` setting started). If GitHub cannot say, the brief goes
+	* on without it.
 	*/
-	const declinedIdeas = async (now) => {
+	const takenLately = async (now) => {
 		const since = (/* @__PURE__ */ new Date(now - 2592e6)).toISOString();
 		try {
-			const [comments, closed] = await Promise.all([gh.commentsSince(since), gh.closedUnmerged(since)]);
-			const struck = comments.flatMap((c) => {
+			const [comments, closed] = await Promise.all([gh.commentsSince(since), gh.closedBotPulls(since)]);
+			const struck = [];
+			const ticked = [];
+			for (const c of comments) {
 				const s = c.authorType === "Bot" ? readSummary(c.body) : null;
-				return s?.next?.length ? struckIdeas(c.body, s.next) : [];
-			});
-			return [.../* @__PURE__ */ new Set([...struck, ...closed])];
+				if (!s?.next?.length) continue;
+				struck.push(...struckIdeas(c.body, s.next));
+				ticked.push(...tickedIdeas(c.body, s.next));
+			}
+			const merged = closed.merged.filter((title) => !ticked.includes(title));
+			return {
+				declined: [.../* @__PURE__ */ new Set([...struck, ...closed.unmerged])],
+				liked: [...ticked, ...merged]
+			};
 		} catch (error) {
-			log(`Aperture Bot: could not read what was turned down: ${require_run.describeError(error)}`);
-			return [];
+			log(`Aperture Bot: could not read what was taken or turned down: ${require_run.describeError(error)}`);
+			return {
+				declined: [],
+				liked: []
+			};
 		}
 	};
 	/**
@@ -2571,9 +2658,14 @@ async function runAction(env, deps = {}) {
 			now: deps.now?.() ?? Date.now()
 		};
 		log(`Aperture Bot: looking ${command.owner}/${command.repo} over`);
-		const declined = await declinedIdeas(view.now);
+		const { declined, liked } = await takenLately(view.now);
 		if (declined.length) log(`Aperture Bot: leaving out ${declined.length} ideas turned down lately`);
-		const brief = briefQuestion(view, todoLines(cwd), declined);
+		const taste = tasteOf(liked);
+		if (taste.length) log(`Aperture Bot: ${liked.length} ideas taken lately; offering more like them first`);
+		const brief = briefQuestion(view, todoLines(cwd), declined, {
+			taste,
+			liked
+		});
 		const result = await answerQuestion({
 			cwd,
 			question: brief.question,
