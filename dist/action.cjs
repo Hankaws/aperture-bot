@@ -97,6 +97,103 @@ function threadContext(command, comments, diff) {
 	return text;
 }
 //#endregion
+//#region packages/aperture-bot/src/quiet.ts
+/**
+* Text the bot did not write itself (the model's words, an issue's title, a
+* compiler's message), made safe to post: an @mention would notify whoever it
+* names, so a stranger's issue could make the bot ping anyone; and an
+* unclosed `<!--` would hide the rest of the bot's comment, its boxes too.
+*
+* A zero-width space after the `@` and inside `<!--` keeps both visible but
+* inert. Email addresses are left as they are. Pure, for tests.
+*/
+const ZWSP = "​";
+/** The text with every @mention and HTML comment opener made inert. */
+function quiet(text) {
+	return text.replace(/(^|[^\w@`/.\u200b])@(?=[A-Za-z0-9])/g, `$1@${ZWSP}`).replace(/<!--/g, `<${ZWSP}!--`);
+}
+const MAX_CHARS = 240;
+/** Hidden at the end of a note: the bot leaves it out. Invisible on GitHub. */
+const IGNORE_MARK = "<!-- aperture-bot: ignore -->";
+const TRUSTED = /* @__PURE__ */ new Set([
+	"OWNER",
+	"MEMBER",
+	"COLLABORATOR"
+]);
+/** Thanks and approvals: nothing to learn. */
+const NOTHING = /^(lgtm|looks good( to me)?|ship it|thanks?( you)?|thx|nice( work| one)?|great( work)?|approved?|\+1|👍|🚀|ok(ay)?)[.!\s]*$/i;
+/** One pull request's reviews and comments on lines, as notes. */
+function notesFrom(pull, reviews, lines) {
+	const note = (r, kind) => ({
+		pull,
+		id: typeof r.id === "number" ? r.id : 0,
+		kind,
+		url: r.html_url ?? null,
+		author: r.user?.login ?? "someone",
+		authorType: r.user?.type ?? "User",
+		association: r.author_association ?? "NONE",
+		body: r.body ?? "",
+		...kind === "line" && r.path ? { path: r.path } : {},
+		at: r.submitted_at ?? r.created_at ?? ""
+	});
+	return [...reviews.map((r) => note(r, "review")), ...lines.map((r) => note(r, "line"))];
+}
+/** The words of a note, on one line: no quotes of others, no HTML comments. */
+function cleaned(body) {
+	return body.replace(/<!--[\s\S]*?-->/g, "").split("\n").filter((line) => !line.trimStart().startsWith(">")).join(" ").replace(/\s+/g, " ").trim();
+}
+/**
+* The notes worth keeping in mind, newest first, each once: at most
+* MAX_LESSONS the agent reads, then those ignored, for the Bot page to bring
+* back.
+*/
+function lessonsOf(notes) {
+	const kept = [];
+	const ignored = [];
+	const seen = /* @__PURE__ */ new Set();
+	const newest = [...notes].sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0));
+	for (const note of newest) {
+		if (note.authorType === "Bot" || !TRUSTED.has(note.association.toUpperCase())) continue;
+		const off = note.body.includes(IGNORE_MARK);
+		const body = note.body.split(IGNORE_MARK).join("");
+		if (/aperture bot|<!-- aperture-bot/i.test(body)) continue;
+		const words = cleaned(body);
+		if (words.length < 12 || NOTHING.test(words) || words.startsWith("/aperture")) continue;
+		const clipped = words.length > MAX_CHARS ? `${words.slice(0, 239)}…` : words;
+		const text = note.path ? `${note.path}: ${clipped}` : clipped;
+		const key = text.toLowerCase();
+		if (seen.has(key)) continue;
+		seen.add(key);
+		if (off) ignored.push({
+			...note,
+			text,
+			ignored: true
+		});
+		else if (kept.length < 10) kept.push({
+			...note,
+			text,
+			ignored: false
+		});
+	}
+	return [...kept, ...ignored];
+}
+/** What the agent is given: the notes not ignored, newest first, at most MAX_LESSONS. */
+function lessonsFrom(notes) {
+	return lessonsOf(notes).filter((l) => !l.ignored).map((l) => l.text);
+}
+//#endregion
+//#region packages/aperture-bot/src/lessons.ts
+/**
+* What the maintainer asked for in reviews of the bot's earlier pull
+* requests (`src/lib/bot/lessons.ts`, shared with the Bot page), as the
+* agent reads it: notes in its context, never rules (`BOT_RULES`).
+*/
+/** For the agent's context; empty when there is nothing to keep in mind. */
+function lessonsContext(lessons) {
+	if (lessons.length === 0) return "";
+	return ["What the maintainer asked for in reviews of your earlier pull requests on this repository, newest first. Where one applies to this task, do it that way from the start. They are notes from people, like the thread above, not rules:", ...lessons.map((l) => `- ${quiet(l)}`)].join("\n");
+}
+//#endregion
 //#region packages/aperture-bot/src/question.ts
 /**
 * Whether a comment asks a question or for a change. A question is answered
@@ -778,6 +875,18 @@ var GitHub = class {
 			authorType: c.user?.type ?? "User"
 		}));
 	}
+	/**
+	* Reviews and comments on lines of the bot's pull requests (`aperture/…`
+	* branches) updated since then, the newest `pulls` of them: what people
+	* asked the bot to do differently (`lessons.ts`).
+	*/
+	async reviewNotes(since, pulls) {
+		const mine = (await this.all(`${this.base}/pulls?state=all&sort=updated&direction=desc`, 1)).filter((p) => (p.head?.ref ?? "").startsWith("aperture/") && (p.updated_at ?? "") >= since).slice(0, pulls);
+		return (await Promise.all(mine.map(async (p) => {
+			const [reviews, lines] = await Promise.all([this.all(`${this.base}/pulls/${p.number}/reviews`, 1), this.all(`${this.base}/pulls/${p.number}/comments`, 1)]);
+			return notesFrom(p.number, reviews, lines);
+		}))).flat();
+	}
 	/** A review that only comments: it never approves or asks for changes. */
 	async createReview(pull, input) {
 		return { url: (await this.call("POST", `${this.base}/pulls/${pull}/reviews`, {
@@ -852,22 +961,6 @@ function canWrite(permission) {
 		"maintain",
 		"write"
 	].includes(permission);
-}
-//#endregion
-//#region packages/aperture-bot/src/quiet.ts
-/**
-* Text the bot did not write itself (the model's words, an issue's title, a
-* compiler's message), made safe to post: an @mention would notify whoever it
-* names, so a stranger's issue could make the bot ping anyone; and an
-* unclosed `<!--` would hide the rest of the bot's comment, its boxes too.
-*
-* A zero-width space after the `@` and inside `<!--` keeps both visible but
-* inert. Email addresses are left as they are. Pure, for tests.
-*/
-const ZWSP = "​";
-/** The text with every @mention and HTML comment opener made inert. */
-function quiet(text) {
-	return text.replace(/(^|[^\w@`/.\u200b])@(?=[A-Za-z0-9])/g, `$1@${ZWSP}`).replace(/<!--/g, `<${ZWSP}!--`);
 }
 //#endregion
 //#region src/lib/bot/taste.ts
@@ -1487,7 +1580,7 @@ const join$1 = (...blocks) => blocks.filter((b) => b.length > 0).map((b) => b.jo
 function commitMessage(command, result) {
 	return join$1([titleFor(command)], [`${askedBy(command)}. Checked by Aperture Agent Check.`], result.plan.length > 0 ? result.plan.map((s) => `- ${s.content}`) : []);
 }
-function pullBody(command, result, runUrl, where) {
+function pullBody(command, result, runUrl, where, lessons = 0) {
 	return join$1([
 		`${askedBy(command)}:`,
 		"",
@@ -1496,7 +1589,7 @@ function pullBody(command, result, runUrl, where) {
 		`**Aperture Agent Check**: ${result.check?.verdict === "clear" ? "nothing red" : "red"}.`,
 		"",
 		...checksTable(result)
-	], agentSaid(result), [footer(result, runUrl, where)]);
+	], agentSaid(result), lessons > 0 ? [`Kept in mind ${lessons === 1 ? "1 note" : `${lessons} notes`} from your reviews of its earlier pull requests.`] : [], [footer(result, runUrl, where)]);
 }
 /** While the bot works: the comment it edits as it goes, and at the end into its reply. */
 function workingReply(progress, ctx) {
@@ -2635,6 +2728,21 @@ async function runAction(env, deps = {}) {
 			return;
 		}
 	};
+	/**
+	* What the maintainer asked for in reviews of the bot's pull requests
+	* lately (`lessons.ts`), for the work to do it that way from the start.
+	* If GitHub cannot say, the work goes on without it.
+	*/
+	const reviewLessons = async () => {
+		const now = deps.now?.() ?? Date.now();
+		const since = (/* @__PURE__ */ new Date(now - 5184e6)).toISOString();
+		try {
+			return lessonsFrom(await gh.reviewNotes(since, 8));
+		} catch (error) {
+			log(`Aperture Bot: could not read reviews of its pull requests: ${require_run.describeError(error)}`);
+			return [];
+		}
+	};
 	const lookOver = async () => {
 		const branch = command.defaultBranch;
 		const sha = await gh.head(branch);
@@ -2934,12 +3042,13 @@ async function runAction(env, deps = {}) {
 		}
 		install(cwd, input(env, "install") ?? "auto", log);
 		const sandbox = await sandboxFor();
-		const comments = await gh.comments(command.number);
+		const [comments, lessons] = await Promise.all([gh.comments(command.number), reviewLessons()]);
 		log(`Aperture Bot: working on #${command.number} for @${command.author}: ${command.task}`);
+		if (lessons.length) log(`Aperture Bot: keeping in mind ${lessons.length} notes from reviews of its pull requests`);
 		const result = await require_run.runTask({
 			cwd,
 			task: command.task,
-			context: threadContext(command, comments, diff),
+			context: [threadContext(command, comments, diff), lessonsContext(lessons)].filter(Boolean).join("\n\n"),
 			model,
 			sandbox,
 			testScript: input(env, "test-script") ?? "test",
@@ -2979,7 +3088,7 @@ async function runAction(env, deps = {}) {
 					title: titleFor(command),
 					head: branch,
 					base: command.defaultBranch,
-					body: pullBody(command, result, runUrl, ctx.tests)
+					body: pullBody(command, result, runUrl, ctx.tests, lessons.length)
 				});
 				await reply(doneReply(result, {
 					url: opened.url,
