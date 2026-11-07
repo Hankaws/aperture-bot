@@ -1,4 +1,4 @@
-const require_run = require("./run-BYS1h24Q.cjs");
+const require_run = require("./run-C_8JkUMA.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_crypto = require("node:crypto");
@@ -1122,6 +1122,21 @@ function withoutDeclined(next, declined) {
 		const k = key(idea);
 		return !keys.some((d) => d === k || d.endsWith("…") && d.length > 20 && k.startsWith(d.slice(0, -1)));
 	});
+}
+/**
+* For the Monday digest: what the bot keeps in mind from the maintainer, as
+* the Bot page's "What your bots learned" shows it. The kinds of work they
+* took (`taste.ts`), how many ideas they turned down are left out, and how
+* many notes from their reviews it reads (`lessons.ts`). Null when it has
+* learned nothing yet.
+*/
+function learnedLine(learned) {
+	const parts = [];
+	const top = learned.taste.slice(0, 2).filter((t) => t.count > 0);
+	if (top.length) parts.push(`you take mostly ${top.map((t) => KIND_WORDS[t.kind]).join(" and ")}`);
+	if (learned.declined) parts.push(`${learned.declined === 1 ? "1 idea" : `${learned.declined} ideas`} you turned down ${learned.declined === 1 ? "is" : "are"} left out`);
+	if (learned.lessons) parts.push(`${learned.lessons === 1 ? "1 note" : `${learned.lessons} notes`} from your reviews ${learned.lessons === 1 ? "is" : "are"} kept in mind`);
+	return parts.length ? `- **What it keeps in mind**: ${parts.join("; ")}.` : null;
 }
 //#endregion
 //#region src/lib/bot/struck.ts
@@ -2798,7 +2813,13 @@ async function runAction(env, deps = {}) {
 			day: "numeric",
 			timeZone: "UTC"
 		});
-		const week = await mondayDigest(view.now);
+		const digest = await mondayDigest(view.now);
+		const learned = digest ? learnedLine({
+			taste,
+			declined: declined.length,
+			lessons: (await reviewLessons()).length
+		}) : null;
+		const week = digest && learned ? [...digest, learned] : digest;
 		const needs = needsYou(view);
 		await reply(lookReply(look, {
 			branch,

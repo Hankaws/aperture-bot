@@ -155039,6 +155039,180 @@ function middleDiff(a, b) {
 	}
 	return out;
 }
+//#endregion
+//#region src/lib/agent/guards.ts
+/**
+* Guards that keep an agent turn productive, after DeepSeek Harness's `guard`
+* and `spill` families. Pure, for tests; the loop (`loop.ts`) wires them in.
+*
+* - **Repeats.** A model that calls the same read with the same arguments,
+*   nothing having changed since, is stuck. It gets the same answer back
+*   without the work being done again, with a reminder to change approach
+*   or finish; from the third time, the reminder is firmer.
+* - **Time limits.** A read or a question to a connected server that hangs
+*   comes back as a clear "took too long" instead of holding the whole turn.
+* - **Long output.** A run's log or a server's answer longer than the model
+*   is shown is kept whole for the turn. The model sees its start and end
+*   and can read any part back with `read_output`, by lines or by search,
+*   instead of the middle being lost.
+*/
+/** Tools whose answer depends only on their arguments and the staged edits: a repeat is answered from the first call. */
+const CACHED = /* @__PURE__ */ new Set([
+	"read_file",
+	"grep",
+	"list_dir",
+	"semantic_search",
+	"find_symbol",
+	"find_references",
+	"run_script",
+	"read_output"
+]);
+/** Arguments as one stable string: the same call in another key order is the same call. */
+function stableArgs(value) {
+	if (Array.isArray(value)) return `[${value.map(stableArgs).join(",")}]`;
+	if (value && typeof value === "object") return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableArgs(value[k])}`).join(",")}}`;
+	return JSON.stringify(value ?? null);
+}
+/** What the model is told on a repeat, the count being how many times it has made this call. */
+function repeatReminder(name, count) {
+	return count >= 3 ? `This is call ${count} of ${name} with the same arguments, and nothing has changed. Stop repeating it: change approach, or finish with what you have.` : `You already called ${name} with these arguments, and nothing has changed since, so here is the same answer again. Use it, try something different, or finish.`;
+}
+const PREVIOUS_CHARS = 2e3;
+/**
+* Remembers each call of a turn, by tool, arguments and the staged edits at
+* the time (`state`): a read after an edit is a new read.
+*/
+var RepeatGuard = class {
+	seen = /* @__PURE__ */ new Map();
+	key(name, args, state) {
+		return `${state}\u0000${name}\u0000${stableArgs(args)}`;
+	}
+	/**
+	* The answer to give instead of running the call again, or null to run it.
+	* A tool with effects (an edit, a server call) always runs.
+	*/
+	before(name, args, state) {
+		if (!CACHED.has(name)) return null;
+		const hit = this.seen.get(this.key(name, args, state));
+		if (!hit) return null;
+		hit.count += 1;
+		const previous = hit.result.length > PREVIOUS_CHARS ? `${hit.result.slice(0, PREVIOUS_CHARS)}\n… (cut here; it is the same as before)` : hit.result;
+		return `${repeatReminder(name, hit.count)}\n\n${previous}`;
+	}
+	/** Records a call that ran; for one with effects, a repeat gets the reminder after its answer. */
+	after(name, args, state, result) {
+		const key = this.key(name, args, state);
+		const hit = this.seen.get(key);
+		if (hit) {
+			hit.count += 1;
+			return `${result}\n\n${repeatReminder(name, hit.count)}`;
+		}
+		this.seen.set(key, {
+			count: 1,
+			result
+		});
+		return result;
+	}
+};
+/** Tools that only read, given a time limit of their own: one that hangs must not hold the turn. */
+const TIMED = /* @__PURE__ */ new Set([
+	"read_file",
+	"grep",
+	"list_dir",
+	"semantic_search",
+	"find_symbol",
+	"find_references",
+	"mcp_call",
+	"read_output"
+]);
+const TOOL_TIMEOUT_MS = 9e4;
+/** The tool's answer, or a clear "took too long" once `ms` have passed. */
+async function withTimeLimit(name, work, ms = TOOL_TIMEOUT_MS) {
+	if (!TIMED.has(name)) return work;
+	let timer;
+	const late = new Promise((resolve) => {
+		timer = setTimeout(() => resolve(`${name} took longer than ${Math.round(ms / 1e3)} s and was stopped. Try a narrower call, or go on without it.`), ms);
+	});
+	try {
+		return await Promise.race([work, late]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+/** Kept whole up to this many characters each, and this many in a turn. */
+const KEEP_MAX_CHARS = 2e5;
+/** Shown of a long answer: its start, then its end, where a failure says why. */
+const SHOW_CHARS = 6e3;
+const HEAD_CHARS = 1500;
+const READ_CHARS = 8e3;
+const MAX_MATCHES = 60;
+/** The long outputs of one turn, numbered from 1. */
+var OutputStore = class {
+	items = [];
+	/** Its number, or null when the turn has kept as many as it may. */
+	keep(text) {
+		if (this.items.length >= 8) return null;
+		this.items.push(text.slice(0, KEEP_MAX_CHARS));
+		return this.items.length;
+	}
+	get(id) {
+		return Number.isInteger(id) && id >= 1 ? this.items[id - 1] : void 0;
+	}
+};
+const lineCount = (text) => text.split("\n").length;
+/** Tells the model where the whole of a long output is, and how to read it. */
+function keptNote(id, text) {
+	return `The whole output is kept as output ${id} (${lineCount(text)} lines). Read any part with read_output({ "id": ${id}, "startLine": 1, "endLine": 80 }), or search it with read_output({ "id": ${id}, "grep": "error" }).`;
+}
+/**
+* A long answer as the model sees it: its start and its end, with the whole
+* kept in `store`. Short ones, or once the turn has kept all it may, as they are
+* (cut to the end, which is where a failure says why).
+*/
+function spillLong(store, text) {
+	if (text.length <= 6e3) return text;
+	const id = store?.keep(text) ?? null;
+	const left = text.length - HEAD_CHARS - 4500;
+	if (id === null) return `… ${text.length - SHOW_CHARS} earlier characters omitted …\n${text.slice(-6e3)}`;
+	return `${text.slice(0, HEAD_CHARS)}\n… ${left} characters left out here …\n${text.slice(-4500)}\n\n${keptNote(id, text)}`;
+}
+/** A kept output's lines, by range or by search, numbered as in the whole. */
+function readOutput(store, args) {
+	const id = Number(args.id);
+	const text = store?.get(id);
+	if (text === void 0) return `No output ${String(args.id ?? "")} was kept in this turn.`;
+	const lines = text.split("\n");
+	const number = (i) => `${String(i + 1).padStart(5, " ")} ${lines[i]}`;
+	const grep = typeof args.grep === "string" ? args.grep.trim() : "";
+	if (grep) {
+		const needle = grep.toLowerCase();
+		const hits = [];
+		let total = 0;
+		lines.forEach((line, i) => {
+			if (!line.toLowerCase().includes(needle)) return;
+			total += 1;
+			if (hits.length < MAX_MATCHES) hits.push(number(i));
+		});
+		if (total === 0) return `No line of output ${id} contains "${grep}".`;
+		const more = total > hits.length ? `\n… ${total - hits.length} more lines match; search for something narrower.` : "";
+		return `${total} ${total === 1 ? "line" : "lines"} of output ${id} ${total === 1 ? "contains" : "contain"} "${grep}":\n${hits.join("\n")}${more}`;
+	}
+	const start = Math.max(1, Math.floor(Number(args.startLine ?? 1)) || 1);
+	const end = Math.min(lines.length, Math.floor(Number(args.endLine ?? start + 79)) || lines.length);
+	if (start > lines.length) return `Output ${id} has ${lines.length} lines.`;
+	const out = [];
+	let size = 0;
+	let last = start - 1;
+	for (let i = start - 1; i < end; i++) {
+		const line = number(i);
+		if (size + line.length > READ_CHARS && out.length > 0) break;
+		out.push(line);
+		size += line.length + 1;
+		last = i + 1;
+	}
+	const more = last < end ? `\n… cut here; read on with "startLine": ${last + 1}` : "";
+	return `Output ${id}, lines ${start}–${last} of ${lines.length}:\n${out.join("\n")}${more}`;
+}
 function parseConfidence(value) {
 	const raw = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
 	if (!Number.isFinite(raw)) return null;
@@ -156130,6 +156304,29 @@ const AGENT_TOOLS = [
 	{
 		type: "function",
 		function: {
+			name: "read_output",
+			description: "Read back a long output kept earlier in this turn (a run's log, a server's answer), which you were shown only the start and end of. Give its id, then either a line range or a word to search for.",
+			parameters: {
+				type: "object",
+				properties: {
+					id: {
+						type: "number",
+						description: "The output's number, from the note that says it was kept."
+					},
+					startLine: { type: "number" },
+					endLine: { type: "number" },
+					grep: {
+						type: "string",
+						description: "Show only the lines containing this text (any case)."
+					}
+				},
+				required: ["id"]
+			}
+		}
+	},
+	{
+		type: "function",
+		function: {
 			name: "note_diff",
 			description: "Typed review decision for one line. bug is true only for a real bug. confidence is 0 to 1. A note is kept only when bug is true and confidence is at least 0.8.",
 			parameters: {
@@ -156178,9 +156375,16 @@ function countReview(ctx, kind) {
 	if (!ctx.reviewTally) return;
 	ctx.reviewTally[kind] += 1;
 }
-function clip(text, max = 8e3) {
-	if (text.length <= max) return text;
-	return `${text.slice(0, max)}\n… truncated`;
+/** A file's numbered lines, cut where they pass `max`, saying where to read on. */
+function clipLines(lines, start, max = 8e3) {
+	const out = [];
+	let size = 0;
+	for (let i = 0; i < lines.length; i++) {
+		if (size + lines[i].length > max && out.length > 0) return `${out.join("\n")}\n… cut here; read on with startLine: ${start + i}`;
+		out.push(lines[i]);
+		size += lines[i].length + 1;
+	}
+	return out.join("\n");
 }
 function nearbySnippet(content, search) {
 	const needle = search.trim().split("\n")[0]?.slice(0, 48) ?? "";
@@ -156246,7 +156450,7 @@ async function executeTool(name, args, ctx) {
 		const lines = content.split("\n");
 		const start = Math.max(1, Number(args.startLine ?? 1));
 		const end = Math.min(lines.length, Number(args.endLine ?? lines.length));
-		return clip(lines.slice(start - 1, end).map((line, i) => `${String(start + i).padStart(4, " ")} ${line}`).join("\n"));
+		return clipLines(lines.slice(start - 1, end).map((line, i) => `${String(start + i).padStart(4, " ")} ${line}`), start);
 	}
 	if (name === "list_dir") {
 		const prefix = String(args.prefix ?? "");
@@ -156467,8 +156671,11 @@ async function executeTool(name, args, ctx) {
 		const handed = ctx.handOff?.(script);
 		if (handed) return handed;
 		if (!ctx.runScript) return "Running is not available for this request. Verify by reading the code instead.";
-		return (await ctx.runScript(script)).text;
+		const result = await ctx.runScript(script);
+		const id = result.full && ctx.outputs ? ctx.outputs.keep(result.full) : null;
+		return id === null ? result.text : `${result.text}\n\n${keptNote(id, result.full)}`;
 	}
+	if (name === "read_output") return readOutput(ctx.outputs, args);
 	if (name === "note_diff") {
 		const path = safeRelPath(String(args.path ?? "")) ?? "";
 		const text = String(args.text ?? "").trim().slice(0, 400);
@@ -156507,14 +156714,14 @@ async function executeTool(name, args, ctx) {
 		const tool = String(args.tool ?? "").trim();
 		const raw = typeof args.arguments === "string" ? args.arguments : JSON.stringify(args.arguments ?? {});
 		if (!server || !tool) return "mcp_call needs server and tool.";
-		return ctx.mcpCall(server, tool, raw || "{}");
+		return spillLong(ctx.outputs, await ctx.mcpCall(server, tool, raw || "{}"));
 	}
 	return `Unknown tool: ${name}`;
 }
 //#endregion
 //#region src/lib/agent/parallel.ts
 function isReadTool(name) {
-	return name === "semantic_search" || name === "grep" || name === "read_file" || name === "list_dir";
+	return name === "semantic_search" || name === "grep" || name === "read_file" || name === "list_dir" || name === "read_output";
 }
 function parseCall(call) {
 	let args = {};
@@ -158714,6 +158921,14 @@ function buildContextMessage(input, files, chunks, leftOut = []) {
 	if (!findRules(files)) parts.push(formatStackContext(files));
 	return parts.filter(Boolean).join("\n\n");
 }
+/** One script run in a sandbox, as the server's runner reports it. */
+/** Calls that stage an edit, and so change what a read or a run would find. */
+const EDIT_TOOLS = /* @__PURE__ */ new Set([
+	"propose_edit",
+	"rename_symbol",
+	"move_file",
+	"delete_file"
+]);
 async function runLoop(input, cfg, emit, signal, host) {
 	const flavor = flavorOf(input);
 	const reviewing = input.role === "review";
@@ -158741,6 +158956,10 @@ async function runLoop(input, cfg, emit, signal, host) {
 	let browserRun;
 	/** The agent's own last sandbox run: the verify step reuses it when the edits have not changed since. */
 	let lastRun;
+	/** The turn's calls, so a stuck model is told it is repeating itself (`guards.ts`). */
+	const repeats = new RepeatGuard();
+	/** Bumped by every call that stages an edit: a read after one is a new read. */
+	let editCalls = 0;
 	/** run_script calls made before any edit. Two of those end the turn instead of spending it. */
 	let scriptsWithoutEdits = 0;
 	const deadline = cfg.deadline ?? null;
@@ -158795,6 +159014,7 @@ async function runLoop(input, cfg, emit, signal, host) {
 		role: input.role,
 		reviewTally,
 		leftOut: new Set(leftOut),
+		outputs: new OutputStore(),
 		runScript: cfg.userId && host.runScript ? async (script) => {
 			const allowed = runAllowance(deadline);
 			if (allowed === 0) {
@@ -158816,7 +159036,8 @@ async function runLoop(input, cfg, emit, signal, host) {
 			const outcome = {
 				text: result.text,
 				passed: result.passed,
-				ran: result.ran
+				ran: result.ran,
+				...result.full ? { full: result.full } : {}
 			};
 			lastRun = {
 				script,
@@ -159093,8 +159314,11 @@ async function runLoop(input, cfg, emit, signal, host) {
 				});
 				const runOne = async (call) => {
 					const started = Date.now();
-					let result = await executeTool(call.name, call.args, ctx);
-					if (!reviewing && (call.name === "read_file" || call.name === "propose_edit")) {
+					const state = String(editCalls);
+					const repeated = repeats.before(call.name, call.args, state);
+					let result = repeated ?? repeats.after(call.name, call.args, state, await withTimeLimit(call.name, executeTool(call.name, call.args, ctx)));
+					if (EDIT_TOOLS.has(call.name)) editCalls += 1;
+					if (!repeated && !reviewing && (call.name === "read_file" || call.name === "propose_edit")) {
 						const path = safeRelPath(String(call.args.path ?? "")) ?? "";
 						const reached = call.name === "read_file" ? !result.startsWith("File not found") : result.startsWith("Edit staged");
 						if (path && reached) result += ruleLoader.forPath(path, call.name === "read_file" ? "read" : "edit");
