@@ -1,4 +1,4 @@
-const require_run = require("./run-C_8JkUMA.cjs");
+const require_run = require("./run-DVNSGNm5.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_crypto = require("node:crypto");
@@ -57,7 +57,8 @@ async function answerQuestion(options, deps = {}) {
 		history: [],
 		standing: askRules(options.maxNext),
 		instruction: require_run.instructionFor(options.question, options.context),
-		files: working.files
+		files: working.files,
+		unattended: true
 	}, { ...options.model }, () => void 0, void 0, host);
 	if (!out.ok) return {
 		ok: false,
@@ -73,7 +74,8 @@ async function answerQuestion(options, deps = {}) {
 	return {
 		ok: true,
 		...split,
-		usage: budget.describe()
+		usage: budget.describe(),
+		skills: out.skills ?? []
 	};
 }
 //#endregion
@@ -291,8 +293,19 @@ const LIMITS = {
 	files: 100,
 	text: 300,
 	error: 1e3,
-	next: 5
+	next: 5,
+	skills: 10,
+	name: 80
 };
+/** A skill's or a script's name: short, and no more than a name may hold. */
+const NAME = /^[A-Za-z0-9][\w:.@/-]*$/;
+/** A skill's file, as `workspace/skills.ts` finds them. */
+const SKILL_PATH = /^\.aperture\/skills\/(?:[^/<>"`]+\.md|[^/<>"`]+\/SKILL\.md)$/i;
+const SKILL_STATUS = /* @__PURE__ */ new Set([
+	"passed",
+	"failed",
+	"not_run"
+]);
 const clip$2 = (text, max) => text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 /** The summary kept to a size a comment can always carry. */
 function bounded(summary) {
@@ -308,7 +321,13 @@ function bounded(summary) {
 		next: summary.next?.slice(0, LIMITS.next).map((task) => clip$2(task, LIMITS.text)),
 		task: summary.task === void 0 ? void 0 : clip$2(summary.task, LIMITS.error),
 		error: summary.error === void 0 ? void 0 : clip$2(summary.error, LIMITS.error),
-		note: summary.note === void 0 ? void 0 : clip$2(summary.note, LIMITS.error)
+		note: summary.note === void 0 ? void 0 : clip$2(summary.note, LIMITS.error),
+		skills: summary.skills?.filter((path) => path.length <= LIMITS.text).slice(0, LIMITS.skills),
+		skillChecks: summary.skillChecks?.slice(0, LIMITS.skills).map((c) => ({
+			skill: clip$2(c.skill, LIMITS.name),
+			script: clip$2(c.script, LIMITS.name),
+			status: c.status
+		}))
 	};
 }
 /**
@@ -387,6 +406,19 @@ function readSummary(body) {
 	if (typeof r.usage === "string") out.usage = r.usage;
 	if (typeof r.error === "string") out.error = r.error;
 	if (typeof r.note === "string" && r.note.trim()) out.note = clip$2(r.note, LIMITS.error);
+	const skills = strings(r.skills)?.filter((path) => path.length <= LIMITS.text && SKILL_PATH.test(path)).slice(0, LIMITS.skills);
+	if (skills?.length) out.skills = skills;
+	if (Array.isArray(r.skillChecks)) {
+		const checks = r.skillChecks.flatMap((row) => {
+			const c = row;
+			return typeof c?.skill === "string" && typeof c.script === "string" && typeof c.status === "string" && NAME.test(c.skill) && NAME.test(c.script) && c.skill.length <= LIMITS.name && c.script.length <= LIMITS.name && SKILL_STATUS.has(c.status) ? [{
+				skill: c.skill,
+				script: c.script,
+				status: c.status
+			}] : [];
+		});
+		if (checks.length) out.skillChecks = checks.slice(0, LIMITS.skills);
+	}
 	return out;
 }
 function isGithubUrl(value) {
@@ -1551,6 +1583,12 @@ function agentSaid(result) {
 		"</details>"
 	];
 }
+/** Which of the project's skills (`.aperture/skills/`) the agent followed, when it loaded any. */
+function skillsLine(paths) {
+	if (!paths?.length) return [];
+	const names = paths.map((path) => `\`${require_run.skillName(path.replace(/\/SKILL\.md$/i, "").split("/").pop() ?? path)}\``);
+	return [`Followed the project's ${names.length === 1 ? "skill" : "skills"} ${names.join(", ")} (\`.aperture/skills/\`).`];
+}
 function footer(result, runUrl, where) {
 	return `${where ? `Tests ran ${where}.` : "Tests were not run."} Used ${result.usage}. [The run](${runUrl}) · [Aperture Bot](${SITE})`;
 }
@@ -1573,7 +1611,13 @@ function resultSummary(result, ctx, link) {
 		tests: ctx.tests,
 		usage: result.usage,
 		error: result.error,
-		...result.next.length ? { next: result.next.map(quiet) } : {}
+		...result.next.length ? { next: result.next.map(quiet) } : {},
+		...result.skills.length ? { skills: result.skills } : {},
+		...result.skillChecks.length ? { skillChecks: result.skillChecks.map((c) => ({
+			skill: c.skill,
+			script: c.script,
+			status: c.status
+		})) } : {}
 	};
 }
 /**
@@ -1604,7 +1648,7 @@ function pullBody(command, result, runUrl, where, lessons = 0) {
 		`**Aperture Agent Check**: ${result.check?.verdict === "clear" ? "nothing red" : "red"}.`,
 		"",
 		...checksTable(result)
-	], agentSaid(result), lessons > 0 ? [`Kept in mind ${lessons === 1 ? "1 note" : `${lessons} notes`} from your reviews of its earlier pull requests.`] : [], [footer(result, runUrl, where)]);
+	], agentSaid(result), skillsLine(result.skills), lessons > 0 ? [`Kept in mind ${lessons === 1 ? "1 note" : `${lessons} notes`} from your reviews of its earlier pull requests.`] : [], [footer(result, runUrl, where)]);
 }
 /** While the bot works: the comment it edits as it goes, and at the end into its reply. */
 function workingReply(progress, ctx) {
@@ -1621,7 +1665,7 @@ function workingReply(progress, ctx) {
 function doneReply(result, link, ctx) {
 	const files = result.written.map((p) => `\`${p}\``).join(", ");
 	const text = link.what === "pull" ? `Opened ${link.url}, changing ${files}. Aperture Agent Check found nothing red.` : `Pushed ${link.url} to this pull request, changing ${files}. Aperture Agent Check found nothing red.`;
-	return join$1([text], plan(result), nextList(result.next), [footer(result, ctx.run, ctx.tests)], [summaryMarker(resultSummary(result, ctx, link))]);
+	return join$1([text], plan(result), skillsLine(result.skills), nextList(result.next), [footer(result, ctx.run, ctx.tests)], [summaryMarker(resultSummary(result, ctx, link))]);
 }
 const OUTCOME = {
 	red: "I made a change, but Aperture Agent Check is still red after my fixes, so I did not push it.",
@@ -1644,7 +1688,7 @@ function notDoneReply(result, diff, ctx) {
 /** A question, answered on the thread: the answer, what the bot would do about it, and nothing changed. */
 function answerReply(answer, ctx) {
 	const wary = ctx.via === "issue" || ctx.via === "red";
-	return join$1([quiet(answer.answer)], nextList(answer.next, void 0, wary), [`Nothing was changed. Used ${ctx.usage}. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
+	return join$1([quiet(answer.answer)], skillsLine(answer.skills), nextList(answer.next, void 0, wary), [`Nothing was changed. Used ${ctx.usage}. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
 		v: 1,
 		state: "clear",
 		kind: "answer",
@@ -1652,6 +1696,7 @@ function answerReply(answer, ctx) {
 		run: ctx.run,
 		...askedFields(ctx),
 		...answer.next.length ? { next: answer.next.map(quiet) } : {},
+		...answer.skills?.length ? { skills: answer.skills } : {},
 		usage: ctx.usage
 	})]);
 }
@@ -2878,7 +2923,8 @@ async function runAction(env, deps = {}) {
 		const next = first ? [first, ...result.next.filter((t) => t.toLowerCase() !== first.toLowerCase())].slice(0, 3) : result.next;
 		const answered = {
 			answer: how.heading ? `${how.heading}\n\n${result.answer}` : result.answer,
-			next
+			next,
+			skills: result.skills
 		};
 		log([answered.answer, ...next.map((task) => `- ${task}`)].join("\n"));
 		answeredText = result.answer;
