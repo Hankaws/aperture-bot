@@ -1,9 +1,9 @@
-const require_run = require("./run-DVNSGNm5.cjs");
+const require_run = require("./run-C7PND1s3.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_crypto = require("node:crypto");
 let node_child_process = require("node:child_process");
-//#region packages/aperture-bot/src/answer.ts
+// packages/aperture-bot/src/answer.ts
 const MAX_ANSWER = 6e3;
 /** "Next:" on a line of its own (bold or a heading too), or "Next: none" when there is nothing. */
 const NEXT_LINE = /^\s*(?:#+\s*)?(?:\*\*)?next(?:\*\*)?\s*:?\s*(?:\*\*)?\s*(?:(?:none|nothing)\.?\s*)?$/i;
@@ -36,8 +36,7 @@ function failingContext(where, sha, failures) {
 	if (failures.length > MAX_FAILURES$1) lines.push(`- and ${failures.length - MAX_FAILURES$1} more`);
 	return lines.join("\n");
 }
-//#endregion
-//#region packages/aperture-bot/src/ask.ts
+// packages/aperture-bot/src/ask.ts
 /** Rules the agent gets when it answers, offering at most `maxNext` tasks. */
 const askRules = (maxNext = 3) => [
 	"You are Aperture Bot, answering a question on a GitHub issue or pull request. Nobody will reply to a question of yours: answer with what you can find.",
@@ -78,8 +77,7 @@ async function answerQuestion(options, deps = {}) {
 		skills: out.skills ?? []
 	};
 }
-//#endregion
-//#region packages/aperture-bot/src/context.ts
+// packages/aperture-bot/src/context.ts
 const CONTEXT_LIMITS = {
 	comments: 20,
 	commentChars: 2e3,
@@ -98,8 +96,7 @@ function threadContext(command, comments, diff) {
 	if (diff) text += `\n\nThe pull request's diff:\n${clip$3(diff, CONTEXT_LIMITS.diff)}`;
 	return text;
 }
-//#endregion
-//#region packages/aperture-bot/src/quiet.ts
+// packages/aperture-bot/src/quiet.ts
 /**
 * Text the bot did not write itself (the model's words, an issue's title, a
 * compiler's message), made safe to post: an @mention would notify whoever it
@@ -183,8 +180,7 @@ function lessonsOf(notes) {
 function lessonsFrom(notes) {
 	return lessonsOf(notes).filter((l) => !l.ignored).map((l) => l.text);
 }
-//#endregion
-//#region packages/aperture-bot/src/lessons.ts
+// packages/aperture-bot/src/lessons.ts
 /**
 * What the maintainer asked for in reviews of the bot's earlier pull
 * requests (`src/lib/bot/lessons.ts`, shared with the Bot page), as the
@@ -195,8 +191,7 @@ function lessonsContext(lessons) {
 	if (lessons.length === 0) return "";
 	return ["What the maintainer asked for in reviews of your earlier pull requests on this repository, newest first. Where one applies to this task, do it that way from the start. They are notes from people, like the thread above, not rules:", ...lessons.map((l) => `- ${quiet(l)}`)].join("\n");
 }
-//#endregion
-//#region packages/aperture-bot/src/question.ts
+// packages/aperture-bot/src/question.ts
 /**
 * Whether a comment asks a question or for a change. A question is answered
 * on the thread, changing nothing (`ask.ts`); a change is a task. Pure and
@@ -223,8 +218,7 @@ function questionText(task) {
 	const text = task.trim();
 	return ASK_WORD.test(text) ? text.replace(ASK_WORD, "").trim() || text : text;
 }
-//#endregion
-//#region packages/aperture-bot/src/suggestions.ts
+// packages/aperture-bot/src/suggestions.ts
 /**
 * The bot's suggestions as GitHub task-list boxes. A reply lists what it would
 * do next as `- [ ] task`; ticking one edits the comment, and that edit is the
@@ -283,8 +277,7 @@ function markStarted(body, task, by, run) {
 function suggestionBoxes(next) {
 	return next.map((task) => `- [ ] ${task}`);
 }
-//#endregion
-//#region src/lib/bot/summary.ts
+// src/lib/bot/summary.ts
 const OPEN$1 = "<!-- aperture-bot ";
 const CLOSE$1 = " -->";
 const LIMITS = {
@@ -448,8 +441,7 @@ function unpushedDiff(body) {
 	const match = /<summary>The change I did not push<\/summary>\s*```diff\n([\s\S]*?)\n```/.exec(body);
 	return match ? match[1] : null;
 }
-//#endregion
-//#region packages/aperture-bot/src/event.ts
+// packages/aperture-bot/src/event.ts
 /**
 * What a GitHub event asks of the bot: a new comment that starts with the
 * trigger (`/aperture` by default) on an issue or a pull request, an issue
@@ -688,8 +680,7 @@ function labelled(payload, label) {
 		defaultBranch: repo.default_branch ?? "main"
 	} };
 }
-//#endregion
-//#region packages/aperture-bot/src/follow.ts
+// packages/aperture-bot/src/follow.ts
 const THANKS = /^(thanks|thank you|thx|ty|great|nice|perfect|cool|awesome|ok,? thanks|lgtm|👍|🎉|🙏|❤️)[\s!.]*$/iu;
 const YES = /^(yes|yep|yeah|yup|ok|okay|sure|go ahead|do it|please do|ship it|sounds good)(,?\s*please)?[\s!.]*$/i;
 const ORDINALS = {
@@ -738,8 +729,7 @@ function askerOf(summary, comments) {
 	if (summary.via === "label" || summary.via === "pull" || summary.via === "tick") return summary.by ?? null;
 	return null;
 }
-//#endregion
-//#region packages/aperture-bot/src/github.ts
+// packages/aperture-bot/src/github.ts
 /**
 * The few GitHub REST calls the bot makes, over plain fetch with the
 * workflow's token. `fetch` is injectable so the tests run against an API
@@ -994,8 +984,7 @@ function canWrite(permission) {
 		"write"
 	].includes(permission);
 }
-//#endregion
-//#region src/lib/bot/taste.ts
+// src/lib/bot/taste.ts
 /** In words, for the brief and the page: "tests", "bug fixes". */
 const KIND_WORDS = {
 	test: "tests",
@@ -1170,8 +1159,7 @@ function learnedLine(learned) {
 	if (learned.lessons) parts.push(`${learned.lessons === 1 ? "1 note" : `${learned.lessons} notes`} from your reviews ${learned.lessons === 1 ? "is" : "are"} kept in mind`);
 	return parts.length ? `- **What it keeps in mind**: ${parts.join("; ")}.` : null;
 }
-//#endregion
-//#region src/lib/bot/struck.ts
+// src/lib/bot/struck.ts
 const STRUCK = /^(\s*[-*] )~~(.+?)~~ · dismissed$/;
 const flat = (text) => text.replace(/\s+/g, " ").trim();
 /** The ideas of `next` that a reply's body shows struck out. */
@@ -1183,8 +1171,7 @@ function struckIdeas(body, next) {
 	}
 	return next.filter((task) => struck.has(flat(task)));
 }
-//#endregion
-//#region packages/aperture-bot/src/review.ts
+// packages/aperture-bot/src/review.ts
 /** The lines of each side a diff's hunks cover: the only ones a review comment may name. */
 function hunkLines(patch) {
 	const right = /* @__PURE__ */ new Set();
@@ -1270,8 +1257,7 @@ function alreadySaid(note, existing) {
 function bugCount(n) {
 	return n === 1 ? "1 likely bug" : `${n} likely bugs`;
 }
-//#endregion
-//#region packages/aperture-bot/src/reviewer.ts
+// packages/aperture-bot/src/reviewer.ts
 async function reviewChanges(options, deps = {}) {
 	const budget = new require_run.Budget(options.maxTokens);
 	const host = require_run.runnerHost(deps.model ?? require_run.providerModel, budget);
@@ -1310,8 +1296,7 @@ async function reviewChanges(options, deps = {}) {
 		usage: budget.describe()
 	};
 }
-//#endregion
-//#region packages/aperture-bot/src/publish.ts
+// packages/aperture-bot/src/publish.ts
 /**
 * Git on the runner: checking out a pull request's branch before a run, and
 * after a clear one, a commit of exactly the files the bot wrote, pushed with
@@ -1523,8 +1508,155 @@ function todoLines(cwd, max = 20) {
 	}
 	return out.split("\n").filter(Boolean).slice(0, max).map((line) => line.length > 200 ? `${line.slice(0, 199)}…` : line.trim());
 }
-//#endregion
-//#region packages/aperture-bot/src/replies.ts
+// src/lib/workspace/skill-draft.ts
+/** Steps and example files a draft lists at most. */
+const MAX_STEPS = 12;
+const MAX_FILES = 8;
+/** Words of the request a skill is named for. */
+const NAME_WORDS = 4;
+const NAME_CHARS = 40;
+const oneLine = (text) => text.replace(/\s+/g, " ").trim();
+/** Words a request starts with that say nothing about the task. */
+const FILLER = /^(please|can|could|would|you|pls|kindly|now|then|and|so|let's|lets)$/i;
+/** Words a name does not end on. */
+const TRAILING = /^(a|an|the|in|on|of|for|to|at|by|with|from|and|or|into|so|that)$/i;
+/** A name from the request's first words: "Please add a migration for orders" → `add-a-migration`. */
+function nameFromRequest(request) {
+	const words = oneLine(request.split("\n")[0] ?? "").split(" ").map((word) => word.replace(/[^\p{L}\p{N}'-]/gu, "")).filter(Boolean);
+	while (words.length > 1 && FILLER.test(words[0])) words.shift();
+	const kept = words.slice(0, NAME_WORDS);
+	while (kept.length > 1 && TRAILING.test(kept[kept.length - 1])) kept.pop();
+	return require_run.skillName(kept.join(" ")).slice(0, NAME_CHARS).replace(/-+$/, "") || "skill";
+}
+/** Requests quoted in a draft's first line at most; the rest are counted. */
+const MAX_QUOTED = 3;
+/**
+* A skill's text, from one run or several of the same kind (oldest first, the
+* newest last): the newest request is what it is for, the newest plan its
+* steps (the newest is usually the better one), and the files and checks of
+* all of them. `taken` are the names and files skills already have, so the
+* draft takes neither.
+*/
+function draftSkill(runs, taken, now = /* @__PURE__ */ new Date(), unit = "agent run") {
+	const latest = runs.at(-1);
+	if (!latest) return null;
+	const plan = [...runs].reverse().find((r) => r.plan.length > 0)?.plan ?? [];
+	const paths = [...new Set(runs.flatMap((r) => r.paths))];
+	if (plan.length === 0 && paths.length === 0) return null;
+	const checks = [...new Set(runs.flatMap((r) => r.checks))].slice(0, require_run.SKILL_LIMIT.checks);
+	const steps = (plan.length > 0 ? plan.map(oneLine).filter(Boolean) : paths.map((path) => `Change \`${path}\`.`)).slice(0, MAX_STEPS);
+	const base = nameFromRequest(latest.request);
+	let name = base;
+	let path = `${require_run.SKILLS_DIR}${name}.md`;
+	for (let n = 2; taken.names.has(name) || taken.paths.has(path); n += 1) {
+		name = `${base}-${n}`;
+		path = `${require_run.SKILLS_DIR}${name}.md`;
+	}
+	const firstLine = (text) => oneLine(text.split("\n")[0] ?? "");
+	const request = firstLine(latest.request);
+	const room = require_run.SKILL_LIMIT.description - 16;
+	const like = request.length > room ? `${request.slice(0, room - 1)}…` : request;
+	const day = now.toISOString().slice(0, 10);
+	const quoted = (text) => {
+		const line = firstLine(text);
+		return `"${line.length > 80 ? `${line.slice(0, 79)}…` : line}"`;
+	};
+	const many = runs.length > 1;
+	const shown = runs.slice(0, MAX_QUOTED).map((r) => quoted(r.request));
+	const more = runs.length - shown.length;
+	const listed = more > 0 ? `${shown.join(", ")} and ${more} more` : `${shown.slice(0, -1).join(", ")} and ${shown.at(-1)}`;
+	const from = many ? `Made on ${day} from ${runs.length} ${unit}s that did this: ${listed}.` : `Made on ${day} from ${unit === "agent run" ? "an" : "a"} ${unit} that did this.`;
+	const short = unit === "agent run" ? "run" : "task";
+	const text = [
+		"---",
+		`name: ${name}`,
+		`description: For tasks like: ${like}`,
+		...checks.length > 0 ? [`checks: ${checks.join(", ")}`] : [],
+		"---",
+		`${from} Make the name, the description and the steps fit every task like it, not only ${many ? "those" : "that one"}: the agent sees the description, and loads these steps when a task matches.`,
+		"",
+		...steps.map((step, i) => `${i + 1}. ${step}`),
+		...paths.length > 0 ? [
+			"",
+			`Files ${many ? `those ${short}s` : `that ${short}`} changed, as examples:`,
+			...paths.slice(0, MAX_FILES).map((p) => `- \`${p}\``),
+			...paths.length > MAX_FILES ? [`- and ${paths.length - MAX_FILES} more`] : []
+		] : [],
+		""
+	].join("\n");
+	return {
+		path,
+		name,
+		text
+	};
+}
+// src/lib/bot/skill-suggest.ts
+/**
+* Skills the Bot page suggests: when a repository's bot was asked for the same
+* kind of task more than once ("Add a migration for orders", then "… for
+* invoices"), and no skill does it yet, the Skills card offers one, drafted
+* from those tasks as the editor drafts one from its runs (`skill-draft.ts`).
+* The person adds it to the repository on GitHub, and the bot then follows it.
+* Pure, for tests.
+*/
+/**
+* The suggestion Aperture Bot adds to its reply when a task repeats an earlier
+* kind: ticked, it saves the skill (`aperture-bot`'s `skill-offer.ts`). Its
+* runs are never a kind of task themselves.
+*/
+const SAVE_SKILL = /^Save tasks like this as a skill: `(\.aperture\/skills\/[^`\s]+\.md)`$/;
+const saveSkillLine = (path) => `Save tasks like this as a skill: \`${path}\``;
+/** The skill's name, from its file: `.aperture/skills/add-a-migration.md` is `add-a-migration`. */
+const skillNameOf = (path) => path.replace(/^\.aperture\/skills\//, "").replace(/\.md$/, "");
+/** Suggestions a repository shows at most: the most asked for first. */
+const MAX_SUGGESTIONS = 3;
+/** Tasks of one kind a draft is made from at most: the newest. */
+const MAX_SOURCES = 5;
+/** A task worth a skill: a change the bot finished, with a plan or files to learn from. */
+function useful(task) {
+	const s = task.summary;
+	if (!s || s.kind || !task.task.trim() || SAVE_SKILL.test(task.task.trim())) return false;
+	if (s.state !== "clear" && s.state !== "red") return false;
+	return (s.plan?.length ?? 0) > 0 || (s.files?.length ?? 0) > 0;
+}
+function skillSuggestions(repo, skills, tasks, now = /* @__PURE__ */ new Date(), max = MAX_SUGGESTIONS) {
+	const taken = {
+		names: new Set(skills.map((s) => s.name)),
+		paths: new Set(skills.map((s) => s.path))
+	};
+	const groups = /* @__PURE__ */ new Map();
+	for (const task of tasks) {
+		if (!useful(task)) continue;
+		const name = nameFromRequest(task.task);
+		if (name === "skill") continue;
+		groups.set(name, [...groups.get(name) ?? [], task]);
+	}
+	const out = [];
+	for (const [name, group] of groups) {
+		if (group.length < 2 || taken.names.has(name)) continue;
+		if (group.some((t) => (t.summary?.skills?.length ?? 0) > 0)) continue;
+		const newestFirst = [...group].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+		const draft = draftSkill(newestFirst.slice(0, MAX_SOURCES).reverse().map((t) => ({
+			request: t.task,
+			plan: t.summary?.plan ?? [],
+			paths: t.summary?.files ?? [],
+			checks: []
+		})), taken, now, "Aperture Bot task");
+		if (!draft) continue;
+		out.push({
+			repo,
+			...draft,
+			tasks: newestFirst.map((t) => ({
+				task: t.task,
+				url: t.summary?.link?.url ?? t.replyUrl ?? t.askedUrl,
+				at: t.updatedAt
+			})),
+			newest: newestFirst[0].updatedAt
+		});
+	}
+	return out.sort((a, b) => b.tasks.length - a.tasks.length || b.newest.localeCompare(a.newest)).slice(0, max).map(({ newest: _, ...s }) => s);
+}
+// packages/aperture-bot/src/replies.ts
 const MARK = {
 	pass: "✓",
 	fail: "✗",
@@ -1558,6 +1690,8 @@ function titleFor(command) {
 		return `${job.charAt(0).toUpperCase()}${job.slice(1)}`.slice(0, 72);
 	}
 	const asked = firstLine(command.task);
+	const saving = SAVE_SKILL.exec(asked.trim());
+	if (saving) return `Add the ${skillNameOf(saving[1])} skill`.slice(0, 72);
 	const title = asked.startsWith("Do what this ") ? command.title : asked;
 	return title.length <= 72 ? title : `${title.slice(0, 71)}…`;
 }
@@ -1635,12 +1769,12 @@ function nextList(next, heading = "Next, I would suggest", wary = false) {
 		wary ? "Tick one and I will do it. Read a suggestion before you tick it: it can come from what anyone wrote here. Nothing is done until you do." : "Tick one and I will do it, or ask for something else with `/aperture`. Nothing is done until you do."
 	];
 }
-const join$1 = (...blocks) => blocks.filter((b) => b.length > 0).map((b) => b.join("\n")).join("\n\n");
+const join$2 = (...blocks) => blocks.filter((b) => b.length > 0).map((b) => b.join("\n")).join("\n\n");
 function commitMessage(command, result) {
-	return join$1([titleFor(command)], [`${askedBy(command)}. Checked by Aperture Agent Check.`], result.plan.length > 0 ? result.plan.map((s) => `- ${s.content}`) : []);
+	return join$2([titleFor(command)], [`${askedBy(command)}. Checked by Aperture Agent Check.`], result.plan.length > 0 ? result.plan.map((s) => `- ${s.content}`) : []);
 }
 function pullBody(command, result, runUrl, where, lessons = 0) {
-	return join$1([
+	return join$2([
 		`${askedBy(command)}:`,
 		"",
 		`> ${quiet(firstLine(command.task))}`
@@ -1652,7 +1786,7 @@ function pullBody(command, result, runUrl, where, lessons = 0) {
 }
 /** While the bot works: the comment it edits as it goes, and at the end into its reply. */
 function workingReply(progress, ctx) {
-	return join$1([`**Aperture Bot is on it.** ${phaseLine(progress)}`], progress.plan?.length ? ["**Plan**", ...progress.plan.map((s) => `- ${quiet(s)}`)] : [], [`[Follow the run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
+	return join$2([`**Aperture Bot is on it.** ${phaseLine(progress)}`], progress.plan?.length ? ["**Plan**", ...progress.plan.map((s) => `- ${quiet(s)}`)] : [], [`[Follow the run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
 		v: 1,
 		state: "working",
 		asked: ctx.asked,
@@ -1665,7 +1799,7 @@ function workingReply(progress, ctx) {
 function doneReply(result, link, ctx) {
 	const files = result.written.map((p) => `\`${p}\``).join(", ");
 	const text = link.what === "pull" ? `Opened ${link.url}, changing ${files}. Aperture Agent Check found nothing red.` : `Pushed ${link.url} to this pull request, changing ${files}. Aperture Agent Check found nothing red.`;
-	return join$1([text], plan(result), skillsLine(result.skills), nextList(result.next), [footer(result, ctx.run, ctx.tests)], [summaryMarker(resultSummary(result, ctx, link))]);
+	return join$2([text], plan(result), skillsLine(result.skills), nextList(result.next), [footer(result, ctx.run, ctx.tests)], [summaryMarker(resultSummary(result, ctx, link))]);
 }
 const OUTCOME = {
 	red: "I made a change, but Aperture Agent Check is still red after my fixes, so I did not push it.",
@@ -1675,7 +1809,7 @@ const OUTCOME = {
 /** On the thread, when nothing was published. */
 function notDoneReply(result, diff, ctx) {
 	const outcome = result.outcome === "clear" ? "no-change" : result.outcome;
-	return join$1([OUTCOME[outcome]], result.error ? [`> ${quiet(result.error)}`] : [], checksTable(result), result.refused.map((r) => `Refused to write \`${r.path}\`: ${r.reason}.`), diff ? [
+	return join$2([OUTCOME[outcome]], result.error ? [`> ${quiet(result.error)}`] : [], checksTable(result), result.refused.map((r) => `Refused to write \`${r.path}\`: ${r.reason}.`), diff ? [
 		"<details><summary>The change I did not push</summary>",
 		"",
 		"```diff",
@@ -1688,7 +1822,7 @@ function notDoneReply(result, diff, ctx) {
 /** A question, answered on the thread: the answer, what the bot would do about it, and nothing changed. */
 function answerReply(answer, ctx) {
 	const wary = ctx.via === "issue" || ctx.via === "red";
-	return join$1([quiet(answer.answer)], skillsLine(answer.skills), nextList(answer.next, void 0, wary), [`Nothing was changed. Used ${ctx.usage}. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
+	return join$2([quiet(answer.answer)], skillsLine(answer.skills), nextList(answer.next, void 0, wary), [`Nothing was changed. Used ${ctx.usage}. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
 		v: 1,
 		state: "clear",
 		kind: "answer",
@@ -1708,7 +1842,7 @@ function reviewReply(review, ctx) {
 	const found = review.placed.length + review.unplaced.length;
 	const counted = found === 1 ? "1 likely bug" : `${found} likely bugs`;
 	const at = ` at ${review.head.slice(0, 7)}`;
-	return join$1([found === 0 ? `**Reviewed**${at}: nothing that looks like a bug.` : `**Reviewed**${at}: ${counted}${review.url ? `, [commented on their lines](${review.url})` : ""}.`], found > 0 ? [...review.placed.map((n) => `- \`${n.path}:${n.line}\`: ${quiet(n.text)}`), ...review.unplaced.map((n) => `- \`${n.path}\`: ${quiet(n.text)}`)] : [], review.skipped > 0 ? [`${review.skipped === 1 ? "1 file was" : `${review.skipped} files were`} not read: binary, very large, or past the first 30.`] : [], nextList(review.next), [`Only what it is at least 80% sure is a bug is posted. Nothing was changed. Used ${ctx.usage}. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
+	return join$2([found === 0 ? `**Reviewed**${at}: nothing that looks like a bug.` : `**Reviewed**${at}: ${counted}${review.url ? `, [commented on their lines](${review.url})` : ""}.`], found > 0 ? [...review.placed.map((n) => `- \`${n.path}:${n.line}\`: ${quiet(n.text)}`), ...review.unplaced.map((n) => `- \`${n.path}\`: ${quiet(n.text)}`)] : [], review.skipped > 0 ? [`${review.skipped === 1 ? "1 file was" : `${review.skipped} files were`} not read: binary, very large, or past the first 30.`] : [], nextList(review.next), [`Only what it is at least 80% sure is a bug is posted. Nothing was changed. Used ${ctx.usage}. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
 		v: 1,
 		state: "clear",
 		kind: "review",
@@ -1721,7 +1855,7 @@ function reviewReply(review, ctx) {
 	})]);
 }
 function forkReply(ctx) {
-	return join$1([
+	return join$2([
 		"This pull request comes from a fork, so Aperture Bot will not check out its code, run it, or push to it.",
 		"",
 		"Ask on an issue instead, or push the branch to this repository and ask on that pull request."
@@ -1739,7 +1873,7 @@ function forkReply(ctx) {
 * a maintainer who meant it can ask for it.
 */
 function unsignedTickReply(ctx, task, trigger) {
-	return join$1([
+	return join$2([
 		"Ticking that box started nothing: Aperture Bot signs the suggestions it lists, and that list has no signature the bot made for this thread. It may come from another bot, be copied from elsewhere, or be older than the signatures.",
 		"",
 		`> ${quiet(task.replace(/\s+/g, " ").trim())}`,
@@ -1754,7 +1888,7 @@ function unsignedTickReply(ctx, task, trigger) {
 }
 /** `/aperture check` on an issue: there is no change to check. */
 function notPullReply(ctx, what = "check") {
-	return join$1([
+	return join$2([
 		what === "check" ? "`/aperture check` runs Aperture Agent Check on a pull request, and this is an issue, so there is nothing to check." : "`/aperture review` reviews a pull request's changes, and this is an issue, so there is nothing to review.",
 		"",
 		"Comment it on the pull request instead, or say what to do after `/aperture` and the bot will make the change."
@@ -1767,7 +1901,7 @@ function notPullReply(ctx, what = "check") {
 	})]);
 }
 function errorReply(message, ctx) {
-	return join$1([
+	return join$2([
 		"Aperture Bot stopped with an error and changed nothing:",
 		"",
 		`> ${quiet(message)}`
@@ -1787,7 +1921,7 @@ function errorReply(message, ctx) {
 function checkReply(check, ctx) {
 	const report = check.rows.length > 0 ? require_run.summaryMarkdown(check.rows, check.meta).trim() : `### Aperture Agent Check\n\n${check.text.replace(/^Aperture Agent Check: /, "")}`;
 	const tests = ctx.tests ? `Tests ran ${ctx.tests}.` : "Tests were not run.";
-	return join$1([report], [`${tests} Nothing was changed. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
+	return join$2([report], [`${tests} Nothing was changed. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
 		v: 1,
 		state: check.verdict,
 		kind: "check",
@@ -1808,7 +1942,7 @@ function checkReply(check, ctx) {
 */
 function lookReply(look, where, ctx) {
 	const at = where.sha ? ` at ${where.sha.slice(0, 7)}` : "";
-	return join$1([`**Daily brief** for ${where.date}, on ${where.branch}${at}.`], ["**What needs you**", ...where.needs], where.week?.length ? ["**Last 7 days**", ...where.week] : [], look.note ? [quiet(look.note)] : [], look.next.length > 0 ? nextList(look.next, "Ideas from the code", true) : ["No ideas worth doing from the code today."], [`Nothing was changed. Used ${ctx.usage}. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
+	return join$2([`**Daily brief** for ${where.date}, on ${where.branch}${at}.`], ["**What needs you**", ...where.needs], where.week?.length ? ["**Last 7 days**", ...where.week] : [], look.note ? [quiet(look.note)] : [], look.next.length > 0 ? nextList(look.next, "Ideas from the code", true) : ["No ideas worth doing from the code today."], [`Nothing was changed. Used ${ctx.usage}. [The run](${ctx.run}) · [Aperture Bot](${SITE})`], [summaryMarker({
 		v: 1,
 		state: "clear",
 		kind: "look",
@@ -1820,8 +1954,7 @@ function lookReply(look, where, ctx) {
 		usage: ctx.usage
 	})]);
 }
-//#endregion
-//#region packages/aperture-bot/src/jobs.ts
+// packages/aperture-bot/src/jobs.ts
 /**
 * Standing jobs: what the bot does when the workflow's schedule (or a manual
 * run) starts it, set by the `scheduled` input. `fix-ci` fixes whatever is
@@ -1964,8 +2097,7 @@ async function planRed(gh, red) {
 		defaultBranch: red.branch
 	} };
 }
-//#endregion
-//#region packages/aperture-bot/src/slack.ts
+// packages/aperture-bot/src/slack.ts
 /** Slack's own hosts for incoming webhooks: the secret must be one, never another address. */
 const WEBHOOK = /^https:\/\/hooks\.slack(-gov)?\.com\/services\/[A-Za-z0-9/_-]+$/;
 function isSlackWebhook(url) {
@@ -2138,8 +2270,94 @@ function isCheck(task) {
 function isLook(task) {
 	return task.summary?.kind === "look";
 }
-//#endregion
-//#region src/lib/bot/week.ts
+// packages/aperture-bot/src/skill-offer.ts
+/**
+* The bot offers a skill in its own reply. When a change it just finished
+* repeats a kind of task it did lately ("Add a migration for orders", then
+* "… for invoices") and no skill covers it, the reply's suggestions end with
+* one more box: save tasks like this as a skill. Ticked, the bot rebuilds the
+* draft from those tasks (`skill-suggest.ts`, as the Bot page does) and the
+* run saves it, fitted to every task of that kind, through the usual checks
+* and pull request. Pure but for `localSkills`, for tests.
+*/
+/** The project's skills, from the checkout: the names and files a draft must not take. */
+function localSkills(cwd) {
+	const dir = (0, node_path.join)(cwd, require_run.SKILLS_DIR);
+	if (!(0, node_fs.existsSync)(dir)) return [];
+	const files = {};
+	try {
+		for (const entry of (0, node_fs.readdirSync)(dir, { withFileTypes: true })) {
+			const path = entry.isDirectory() ? `${require_run.SKILLS_DIR}${entry.name}/SKILL.md` : `${require_run.SKILLS_DIR}${entry.name}`;
+			if (!require_run.isSkillPath(path) || !(0, node_fs.existsSync)((0, node_path.join)(cwd, path))) continue;
+			files[path] = (0, node_fs.readFileSync)((0, node_path.join)(cwd, path), "utf8");
+		}
+	} catch {}
+	return require_run.projectSkills(files);
+}
+/**
+* The skill to offer after `done`, or null: when it repeats a kind of task in
+* `earlier` (the repository's recent tasks), followed no skill, and no skill
+* has that name. A run that saved a skill is never a kind of task to save.
+*/
+function skillOffer(repo, done, earlier, skills, now = /* @__PURE__ */ new Date()) {
+	if (SAVE_SKILL.test(done.task.trim()) || !done.url) return null;
+	return skillSuggestions(repo, skills, [{
+		id: -1,
+		via: "comment",
+		number: 0,
+		thread: null,
+		task: done.task,
+		author: "",
+		askedAt: done.at,
+		askedUrl: done.url,
+		state: "clear",
+		summary: {
+			v: 1,
+			state: "clear",
+			asked: 0,
+			run: "",
+			plan: done.plan,
+			files: done.files,
+			...done.followed.length ? { skills: done.followed } : {}
+		},
+		replyUrl: null,
+		updatedAt: done.at,
+		diff: null
+	}, ...earlier.filter((t) => (t.summary?.link?.url ?? t.replyUrl ?? t.askedUrl) !== done.url)], now, Infinity).find((s) => s.tasks.some((t) => t.url === done.url)) ?? null;
+}
+/**
+* The draft for a skill a reply offered, rebuilt from the recent tasks when
+* its box is ticked: null when they no longer make one (a skill took the
+* name, or they are older than the bot looks back).
+*/
+function draftFor(repo, path, earlier, skills, now = /* @__PURE__ */ new Date()) {
+	return skillSuggestions(repo, skills, earlier, now, Infinity).find((s) => s.path === path) ?? null;
+}
+/**
+* The run a ticked "save as skill" box starts: the instruction, and the draft
+* when the tasks it came from can still be read. Without one (they are older
+* than the bot looks back), the agent writes the skill from the repository.
+*/
+function saveSkillTask(path, draft) {
+	const name = skillNameOf(path);
+	const from = draft?.tasks.length ? ` It was drafted from ${draft.tasks.length} recent tasks of this kind: ${draft.tasks.slice(0, 5).map((t) => `"${t.task.split("\n")[0].slice(0, 120)}"`).join(", ")}.` : "";
+	return [
+		`Save tasks like this as a skill: \`${path}\`.`,
+		"",
+		`Write the skill \`${path}\`, named \`${name}\`, so that from now on tasks of this kind are done the same way.${from}`,
+		"Keep its front matter: `name`, then a `description` that says which tasks it is for, in the words such a task would use, and `checks` when the steps need a script to pass. Then fit it to every task of this kind, not only those: steps that hold for any of them, read from this repository's code and from the files listed as examples. Drop the line saying where the draft came from.",
+		`If \`${path}\` already exists, or another skill already covers these tasks, change nothing and say so. Change no other file.`,
+		...draft ? [
+			"",
+			"The draft:",
+			"",
+			"```markdown",
+			draft.text.trimEnd(),
+			"```"
+		] : []
+	].join("\n");
+}
+// src/lib/bot/week.ts
 /**
 * What the bots did in the last seven days, across the team's repositories,
 * for the stat tiles over the activity feed. Counted from the same tasks the
@@ -2279,8 +2497,7 @@ function weekLines(w) {
 	const note = weekNote(w);
 	return note ? [...lines, note] : lines;
 }
-//#endregion
-//#region packages/aperture-bot/src/seal.ts
+// packages/aperture-bot/src/seal.ts
 /**
 * The bot's suggestion lists, signed. Ticking a box in a reply runs its
 * suggestion as a task, so a list must be one this bot wrote: another bot
@@ -2339,8 +2556,7 @@ function isSealed(body, key, scope) {
 	const got = Buffer.from(summary.sig);
 	return got.length === want.length && (0, node_crypto.timingSafeEqual)(got, want);
 }
-//#endregion
-//#region packages/aperture-bot/src/action.ts
+// packages/aperture-bot/src/action.ts
 /**
 * Aperture Bot as a GitHub Action. A comment that starts with `/aperture`, or
 * the `aperture` label on an issue, from someone with write access becomes a
@@ -2769,6 +2985,25 @@ async function runAction(env, deps = {}) {
 		}
 	};
 	/**
+	* The repository's bot tasks of the last few weeks, read from its comments
+	* as the Bot page reads them: what a skill offer looks for repeats in. If
+	* GitHub cannot say, there is no offer.
+	*/
+	const recentTasks = async (now) => {
+		try {
+			const since = (/* @__PURE__ */ new Date(now - 2592e6)).toISOString();
+			const raw = await gh.rawCommentsSince(since);
+			const trigger = input(env, "trigger") ?? "/aperture";
+			return tasksFrom(raw, /* @__PURE__ */ new Map(), {
+				now,
+				trigger
+			});
+		} catch (error) {
+			log(`Aperture Bot: could not read recent tasks for a skill: ${require_run.describeError(error)}`);
+			return [];
+		}
+	};
+	/**
 	* On Mondays (UTC), the brief carries the week's digest: what the bot did in
 	* the last seven days, counted from its own summaries on GitHub as the Bot
 	* page counts them. No model call; if GitHub cannot say, the brief goes
@@ -3112,9 +3347,12 @@ async function runAction(env, deps = {}) {
 		const [comments, lessons] = await Promise.all([gh.comments(command.number), reviewLessons()]);
 		log(`Aperture Bot: working on #${command.number} for @${command.author}: ${command.task}`);
 		if (lessons.length) log(`Aperture Bot: keeping in mind ${lessons.length} notes from reviews of its pull requests`);
+		const saving = command.via === "tick" ? SAVE_SKILL.exec(command.task.trim()) : null;
+		const repoName = `${command.owner}/${command.repo}`;
+		const task = saving ? saveSkillTask(saving[1], draftFor(repoName, saving[1], await recentTasks(deps.now?.() ?? Date.now()), localSkills(cwd))) : command.task;
 		const result = await require_run.runTask({
 			cwd,
-			task: command.task,
+			task,
 			context: [threadContext(command, comments, diff), lessonsContext(lessons)].filter(Boolean).join("\n\n"),
 			model,
 			sandbox,
@@ -3132,6 +3370,28 @@ async function runAction(env, deps = {}) {
 			...asked,
 			tests: sandbox?.where ?? null
 		};
+		/**
+		* When this change repeats a kind of task the bot did lately and no skill
+		* covers it, its suggestions end with one to save it as a skill.
+		*/
+		const offerSkill = async (url) => {
+			if (saving) return;
+			const now = deps.now?.() ?? Date.now();
+			const offer = await Promise.resolve().then(async () => skillOffer(repoName, {
+				task: command.task,
+				plan: result.plan.map((s) => s.content),
+				files: result.written,
+				followed: result.skills,
+				url,
+				at: new Date(now).toISOString()
+			}, await recentTasks(now), localSkills(cwd), new Date(now))).catch((error) => {
+				log(`Aperture Bot: no skill offered: ${require_run.describeError(error)}`);
+				return null;
+			});
+			if (!offer) return;
+			log(`Aperture Bot: tasks like this came ${offer.tasks.length} times: offering ${offer.path}`);
+			result.next = [...result.next, saveSkillLine(offer.path)];
+		};
 		if (result.outcome === "clear") {
 			await report({
 				phase: "publishing",
@@ -3140,8 +3400,10 @@ async function runAction(env, deps = {}) {
 			const sha = commitFiles(cwd, result.written, commitMessage(command, result), authorFor(poster));
 			if (pull) {
 				push(cwd, pull.headRef);
+				const url = `${repoUrl}/commit/${sha}`;
+				await offerSkill(url);
 				await reply(doneReply(result, {
-					url: `${repoUrl}/commit/${sha}`,
+					url,
 					what: "commit"
 				}, ctx));
 				setOutput(env, {
@@ -3157,6 +3419,7 @@ async function runAction(env, deps = {}) {
 					base: command.defaultBranch,
 					body: pullBody(command, result, runUrl, ctx.tests, lessons.length)
 				});
+				await offerSkill(opened.url);
 				await reply(doneReply(result, {
 					url: opened.url,
 					what: "pull"
@@ -3188,8 +3451,7 @@ async function runAction(env, deps = {}) {
 		return 1;
 	}
 }
-//#endregion
-//#region packages/aperture-bot/src/action-entry.ts
+// packages/aperture-bot/src/action-entry.ts
 /**
 * The Action's entry point: dist/action.cjs, which action.yml runs.
 */
@@ -3199,4 +3461,3 @@ runAction(process.env).then((code) => {
 	console.log(`::error title=Aperture Bot::${error instanceof Error ? error.message : String(error)}`);
 	process.exitCode = 2;
 });
-//#endregion

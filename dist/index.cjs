@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-const require_run = require("./run-DVNSGNm5.cjs");
+const require_run = require("./run-C7PND1s3.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
-//#region packages/aperture-bot/src/main.ts
+// packages/aperture-bot/src/main.ts
 /**
 * Aperture Bot from a terminal: `aperture-bot run --task "…"`: one task on the checkout in the current
 * directory, edits left on disk. The model key comes from APERTURE_MODEL_KEY,
@@ -95,12 +95,10 @@ async function main(argv, env) {
 		return 2;
 	}
 }
-//#endregion
-//#region packages/aperture-bot/src/cli.ts
+// packages/aperture-bot/src/cli.ts
 /**
 *   APERTURE_MODEL_KEY=… aperture-bot run --task "Add a currency to formatPrice"
 */
 main(process.argv.slice(2), process.env).then((code) => {
 	process.exitCode = code;
 });
-//#endregion
