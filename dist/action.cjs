@@ -1,4 +1,4 @@
-const require_run = require("./run-C7PND1s3.cjs");
+const require_run = require("./run-oZPxhNtS.cjs");
 let node_fs = require("node:fs");
 let node_path = require("node:path");
 let node_crypto = require("node:crypto");
@@ -2357,6 +2357,12 @@ function saveSkillTask(path, draft) {
 		] : []
 	].join("\n");
 }
+// src/lib/bot/usage.ts
+/** The pull request a link points at: `…/pull/12` is 12. */
+function pullNumber(url) {
+	const match = /\/pull\/(\d+)(?:$|[/#?])/.exec(url ?? "");
+	return match ? Number(match[1]) : null;
+}
 // src/lib/bot/week.ts
 /**
 * What the bots did in the last seven days, across the team's repositories,
@@ -2387,10 +2393,6 @@ const EMPTY_WEEK = {
 	briefs: 0,
 	ticked: 0
 };
-function pullNumber(url) {
-	const match = /\/pull\/(\d+)(?:$|[/#?])/.exec(url ?? "");
-	return match ? Number(match[1]) : null;
-}
 /** "3 likely bugs" or "1 likely bug", as a review's summary says it; 0 for anything else. */
 function bugsIn(note) {
 	const match = /^(\d+) likely bugs?$/.exec(note ?? "");
