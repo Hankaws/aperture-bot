@@ -155250,6 +155250,12 @@ function names(list, max = 4) {
 	const shown = list.slice(0, max).join(", ");
 	return list.length > max ? `${shown} and ${list.length - max} more` : shown;
 }
+/** A finding is shown after its first file's path: the others, if any, follow it. */
+function alsoIn(paths) {
+	const rest = paths.slice(1);
+	if (rest.length === 0) return "";
+	return `, and so ${rest.length === 1 ? "does" : "do"} ${names(rest)}`;
+}
 function keysIn(path, before, after) {
 	const out = [];
 	for (const { text, line } of addedLines$1(before, after)) {
@@ -155405,12 +155411,12 @@ function safetyFindings(files, edits) {
 	if (ci.length > 0) out.push({
 		level: "look",
 		path: ci[0],
-		what: `edits the CI that checks your pull requests (${names(ci)})`
+		what: `edits the CI that checks your pull requests${alsoIn(ci)}`
 	});
 	if (lockfiles.length > 0 && !depsMoved) out.push({
 		level: "look",
 		path: lockfiles[0],
-		what: `changes ${names(lockfiles)} with no dependency change in package.json`
+		what: `moves with no dependency change in package.json${alsoIn(lockfiles)}`
 	});
 	return [...out.filter((f) => f.level === "red"), ...out.filter((f) => f.level === "look")];
 }
@@ -156223,7 +156229,7 @@ function staticChangeChecks(input) {
 		description,
 		status: "pending"
 	}));
-	return withDeletedImports(changeChecks({
+	const checked = withDeletedImports(changeChecks({
 		files: input.before,
 		edits: [
 			...edits,
@@ -156235,6 +156241,16 @@ function staticChangeChecks(input) {
 		tsc: tscCheck,
 		parse: tsParseCheck(input.tsc)
 	}), importers, input.before, after);
+	const others = input.safetyOnly ?? [];
+	if (others.length === 0) return checked;
+	const files = { ...input.before };
+	for (const other of others) files[other.path] = other.oldText;
+	const safety = safetyRow(safetyFindings(files, [
+		...edits,
+		...emptied,
+		...others
+	]));
+	return checked.map((row) => row.id === "safety" ? safety : row);
 }
 // packages/agent-check/src/baseline.ts
 /**
@@ -156441,6 +156457,10 @@ function installedFiles(cwd) {
 * or a test that a change breaks is in view, not only the changed files.
 * Every other file is there too, unread and empty, so that an import of
 * `./logo.svg` or `./notes.md?raw` finds it.
+*
+* A changed file that is not code (a `.env`, a CI workflow, a YAML lockfile,
+* a key in a `.pem` or `.py`) is still read, before and after, for Safety
+* alone: what it guards against is mostly in files like these.
 */
 const LOAD_LIMITS = {
 	files: 5e3,
@@ -156452,9 +156472,14 @@ const SKIPPED_DIR$1 = /(^|\/)(node_modules|\.git)\//;
 function isRelevant(path) {
 	return RELEVANT.test(path) && !SKIPPED_DIR$1.test(path);
 }
+/** Text, judged the way git does: no NUL byte near the start. */
+function isText(bytes) {
+	return !bytes.subarray(0, 8e3).includes(0);
+}
 function loadProject(cwd, rev) {
 	const changes = {};
 	const deleted = [];
+	const safetyOnly = [];
 	const notChecked = [];
 	const changed = changedFiles(rev, cwd);
 	const tracked = filesAt(rev, cwd);
@@ -156464,16 +156489,21 @@ function loadProject(cwd, rev) {
 		before: {},
 		changes,
 		deleted,
+		safetyOnly,
 		notChecked: changed.map((change) => change.path),
 		tooLarge: `The project has ${listed.length.toLocaleString("en-US")} files to read (${Math.round(total / 1e6)} MB); the limit is ${LOAD_LIMITS.files.toLocaleString("en-US")} files and ${LOAD_LIMITS.totalBytes / 1e6} MB.`
 	};
 	const before = readAt(rev, listed.map((file) => file.path), cwd);
 	for (const file of tracked) if (!RELEVANT.test(file.path) && !SKIPPED_DIR$1.test(file.path)) before[file.path] = "";
+	const sizeAt = new Map(tracked.map((file) => [file.path, file.bytes]));
+	const othersBefore = readAt(rev, changed.filter((change) => !isRelevant(change.path) && !SKIPPED_DIR$1.test(change.path)).filter((change) => change.status !== "A" && (sizeAt.get(change.path) ?? 0) <= LOAD_LIMITS.fileBytes).map((change) => change.path), cwd);
 	for (const change of changed) {
 		if (!isRelevant(change.path)) {
-			notChecked.push(change.path);
 			if (change.status === "D") delete before[change.path];
 			else if (!SKIPPED_DIR$1.test(change.path)) before[change.path] ??= "";
+			const other = SKIPPED_DIR$1.test(change.path) ? null : readOther(cwd, change, othersBefore);
+			if (other) safetyOnly.push(other);
+			else notChecked.push(change.path);
 			continue;
 		}
 		if (change.status === "D") {
@@ -156497,11 +156527,41 @@ function loadProject(cwd, rev) {
 		before,
 		changes,
 		deleted,
+		safetyOnly,
 		notChecked,
 		tooLarge: null
 	};
 }
+/** A changed file that is not code, as Safety reads it; null when it is binary or too big to read. */
+function readOther(cwd, change, base) {
+	const oldText = base[change.path];
+	if (change.status !== "A" && oldText === void 0) return null;
+	if (oldText !== void 0 && oldText.includes("\0")) return null;
+	if (change.status === "D") return {
+		path: change.path,
+		oldText,
+		newText: "",
+		deleted: true
+	};
+	let bytes;
+	try {
+		const full = (0, node_path.join)(cwd, change.path);
+		if ((0, node_fs.statSync)(full).size > LOAD_LIMITS.fileBytes) return null;
+		bytes = (0, node_fs.readFileSync)(full);
+	} catch {
+		return null;
+	}
+	if (!isText(bytes)) return null;
+	return {
+		path: change.path,
+		oldText: oldText ?? "",
+		newText: bytes.toString("utf8")
+	};
+}
 // packages/agent-check/src/report.ts
+function listed(paths, max, code = false) {
+	return `${paths.slice(0, max).map((path) => code ? `\`${path}\`` : path).join(", ")}${paths.length > max ? `, and ${paths.length - max} more` : ""}`;
+}
 const MARK = {
 	pass: "✓",
 	fail: "✗",
@@ -156526,7 +156586,10 @@ function consoleText(rows, meta) {
 		lines.push(`${MARK[row.status] ?? "?"} ${row.label}: ${row.detail}`);
 		if (row.status === "fail" && row.evidence) lines.push(row.evidence.slice(0, 6e3).replace(/^/gm, "    "));
 	}
-	if (meta.notChecked.length > 0) lines.push("", `Not checked: ${meta.notChecked.length} changed file(s) that are not JavaScript, TypeScript, JSON, HTML or CSS, or are over 1 MB.`);
+	const safetyOnly = meta.safetyOnly ?? [];
+	if (safetyOnly.length > 0 || meta.notChecked.length > 0) lines.push("");
+	if (safetyOnly.length > 0) lines.push(`Safety only: ${listed(safetyOnly, 10)}. Not code, so the other checks do not read ${safetyOnly.length === 1 ? "it" : "them"}.`);
+	if (meta.notChecked.length > 0) lines.push(`Not checked: ${listed(meta.notChecked, 10)} (binary, or over 1 MB).`);
 	return lines.join("\n");
 }
 const cell = (text) => text.replace(/\|/g, "\\|").replace(/\n/g, " ");
@@ -156543,10 +156606,9 @@ function summaryMarkdown(rows, meta) {
 	for (const row of shownRows(rows)) lines.push(`| ${MARK[row.status] ?? "?"} | ${cell(row.label)} | ${cell(row.detail)} |`);
 	const red = shownRows(rows).filter((row) => row.status === "fail" && row.evidence);
 	for (const row of red) lines.push("", `<details><summary>${cell(row.label)}: everything it found</summary>`, "", "```", row.evidence.slice(0, 2e4), "```", "", "</details>");
-	if (meta.notChecked.length > 0) {
-		const shown = meta.notChecked.slice(0, 20).map((path) => `\`${path}\``).join(", ");
-		lines.push("", `Not checked: ${shown}${meta.notChecked.length > 20 ? `, and ${meta.notChecked.length - 20} more` : ""}.`);
-	}
+	const safetyOnly = meta.safetyOnly ?? [];
+	if (safetyOnly.length > 0) lines.push("", `Safety only: ${listed(safetyOnly, 20, true)}. Not code, so the other checks do not read ${safetyOnly.length === 1 ? "it" : "them"}.`);
+	if (meta.notChecked.length > 0) lines.push("", `Not checked: ${listed(meta.notChecked, 20, true)} (binary, or over 1 MB).`);
 	lines.push("", "Same checks as the [Aperture](https://aperturesais.grok.me/bot?tab=check) editor. Nothing left this runner.");
 	return `${lines.join("\n")}\n`;
 }
@@ -156692,8 +156754,8 @@ function runTestsAtBase(cwd, rev, script, timeoutMs, runner) {
 // packages/agent-check/src/main.ts
 /**
 * Aperture Agent Check: the editor's checks on a pull request. Reads the
-* change from git, runs Parses, Imports resolve, Types and the project's
-* tests, and reports as GitHub annotations, a run summary and an exit code.
+* change from git, runs Parses, Imports resolve, Types, the project's tests
+* and Safety (which reads every changed text file, code or not), and reports as GitHub annotations, a run summary and an exit code.
 *
 * As a GitHub Action its settings arrive as INPUT_* variables; on a machine
 * they are flags (see `parseOptions`).
@@ -156760,10 +156822,12 @@ function testsFor(options, rev) {
 function check(options) {
 	const rev = mergeBase(options.base, options.cwd);
 	const project = loadProject(options.cwd, rev);
+	const others = project.safetyOnly;
 	const meta = {
-		changed: Object.keys(project.changes).length,
-		deleted: project.deleted.length,
-		notChecked: project.notChecked
+		changed: Object.keys(project.changes).length + others.filter((f) => !f.deleted).length,
+		deleted: project.deleted.length + others.filter((f) => f.deleted).length,
+		notChecked: project.notChecked,
+		safetyOnly: others.map((f) => f.path)
 	};
 	if (project.tooLarge) return {
 		rows: [],
@@ -156777,8 +156841,9 @@ function check(options) {
 		meta,
 		verdict: "clear",
 		exitCode: 0,
-		text: "Aperture Agent Check: nothing to check. This change touches no JavaScript, TypeScript, JSON, HTML or CSS."
+		text: "Aperture Agent Check: nothing to check. Every file this change touches is binary or over 1 MB."
 	};
+	const code = Object.keys(project.changes).length + project.deleted.length > 0;
 	const rows = shownRows(staticChangeChecks({
 		tsc: import_typescript.default,
 		readLib: libReader(),
@@ -156786,10 +156851,14 @@ function check(options) {
 		before: project.before,
 		changes: project.changes,
 		deleted: project.deleted,
-		tests: testsFor(options, rev),
+		tests: code ? testsFor(options, rev) : {
+			state: "unsupported",
+			reason: "this change touches no code."
+		},
 		description: "Pull request",
 		tscLimits: RUNNER_TSC_LIMITS,
-		installed: installedFiles(options.cwd)
+		installed: installedFiles(options.cwd),
+		safetyOnly: others
 	}));
 	const result = verdict(rows);
 	return {
