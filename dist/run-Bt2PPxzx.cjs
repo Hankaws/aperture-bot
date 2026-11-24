@@ -149639,6 +149639,10 @@ const TEST_SETUP = /(^|\/)(vitest|jest)\.(config|setup)\.[cm]?[jt]s$|(^|\/)setup
 /** A declared test, skipped or not: `test(`, `it.each(…)(`, `t.test(`, `xit(`. */
 const DECLARED = /\b(?:it|test)\s*(?:\.\s*\w+\s*)*\(|\bx(?:it|test)\s*\(/g;
 const SKIPPED = /\b(?:it|test|describe|suite)\s*\.\s*(?:skip|todo)\b|\bx(?:it|test|describe)\s*\(|\b(?:skip|todo)\s*:\s*true|\b(?:t|ctx|context)\s*\.\s*skip\s*\(/g;
+/** `test.skip(condition, "reason")`: skipped only where the condition holds, and says why. */
+const CONDITIONAL_SKIP = /\b(?:it|test|describe)\s*\.\s*skip\s*\(\s*(?!['"`])[^,()]*(?:\([^()]*\)[^,()]*)*,\s*['"`]/g;
+/** The title a test is declared with, when it is a plain string. */
+const TITLED = /\b(?:it|test)\s*(?:\.\s*\w+\s*)*\(\s*(['"])((?:\\.|(?!\1)[^\\\n])*)\1/g;
 const FOCUSED = /\b(?:it|test|describe|suite)\s*\.\s*only\b|\bf(?:it|describe)\s*\(|\bonly\s*:\s*true/g;
 const EXITS = /\bprocess\s*\.\s*(?:exit\s*\(|exitCode\s*=|kill\s*\(\s*process\s*\.\s*pid)/g;
 /** Outside test files only a clean exit is suspect: it ends a real Node test run early, green. */
@@ -149651,8 +149655,20 @@ function isTestPath(path) {
 function code(text) {
 	return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`\\])\/\/.*$/gm, "$1");
 }
+/** Strings emptied, quotes kept: `"test.skip("` written as data (a fixture, a message) is not a skip. */
+function bare(text) {
+	return text.replace(/(['"`])(?:\\.|(?!\1)[^\\\n])*\1/g, "$1$1");
+}
 function count$2(re, text) {
-	return (code(text).match(re) ?? []).length;
+	return (bare(code(text)).match(re) ?? []).length;
+}
+/** Each test's title, as often as it is declared. */
+function titles(text) {
+	return [...code(text).matchAll(TITLED)].map((m) => m[2]);
+}
+/** Skips that are not conditional with a reason. */
+function bareSkips(text) {
+	return count$2(SKIPPED, text) - count$2(CONDITIONAL_SKIP, text);
 }
 function plural$1(n, word) {
 	return `${n} ${word}${n === 1 ? "" : "s"}`;
@@ -149717,12 +149733,45 @@ function movedTests(files, edits) {
 	}
 	return moves;
 }
-/** What the change does to the tests, one clause each ("skips 1 test in tests/a.test.ts"); empty when nothing. */
-function testTampering(files, edits) {
-	const found = [];
+/** What the change does to the tests: what holds it (`red`) and what is worth a look (`look`). One clause each. */
+function testChanges(files, edits) {
+	const red = [];
+	const look = [];
 	const entryPoints = executables(files);
 	const moves = movedTests(files, edits);
 	const movedTo = new Set(moves.values());
+	const gained = /* @__PURE__ */ new Map();
+	for (const edit of edits) {
+		if (!isTestPath(edit.path)) continue;
+		const had = /* @__PURE__ */ new Map();
+		for (const t of titles(files[edit.path] ?? "")) had.set(t, (had.get(t) ?? 0) + 1);
+		for (const t of titles(edit.newText)) {
+			const n = had.get(t) ?? 0;
+			if (n > 0) had.set(t, n - 1);
+			else gained.set(t, (gained.get(t) ?? 0) + 1);
+		}
+	}
+	/** How many of `lost` reappear in another file of the change; those are used up. */
+	const reappear = (lost) => {
+		let found = 0;
+		for (const t of lost) {
+			const n = gained.get(t) ?? 0;
+			if (n > 0) {
+				gained.set(t, n - 1);
+				found += 1;
+			}
+		}
+		return found;
+	};
+	const lostTitles = (was, now) => {
+		const left = /* @__PURE__ */ new Map();
+		for (const t of titles(now)) left.set(t, (left.get(t) ?? 0) + 1);
+		return titles(was).filter((t) => {
+			const n = left.get(t) ?? 0;
+			if (n > 0) left.set(t, n - 1);
+			return n === 0;
+		});
+	};
 	for (const edit of edits) {
 		if (movedTo.has(edit.path)) continue;
 		const to = moves.get(edit.path);
@@ -149732,27 +149781,33 @@ function testTampering(files, edits) {
 		if (path === "package.json" || path.endsWith("/package.json")) {
 			const was = testScript(before);
 			const now = testScript(newText);
-			if (was !== null && now !== was && !(now !== null && widensTestScript(was, now))) found.push(`changes the test script in ${path} from "${was}" to "${now ?? "nothing"}"`);
+			if (was !== null && now !== was && !(now !== null && widensTestScript(was, now))) red.push(`changes the test script in ${path} from "${was}" to "${now ?? "nothing"}"`);
 			continue;
 		}
 		if (!isTestPath(path)) {
 			const executable = entryPoints.has(path) || /(^|\/)bin\//.test(path);
-			if (SCRIPT$1.test(path) && !executable && count$2(CLEAN_EXIT, newText) > count$2(CLEAN_EXIT, before)) found.push(`calls process.exit(0) in ${path}, which ends a test run early as a pass`);
+			if (SCRIPT$1.test(path) && !executable && count$2(CLEAN_EXIT, newText) > count$2(CLEAN_EXIT, before)) red.push(`calls process.exit(0) in ${path}, which ends a test run early as a pass`);
 			continue;
 		}
 		if (newText === "" && before !== "") {
-			const tests = count$2(DECLARED, before);
-			found.push(`deletes ${path}${tests ? ` and its ${plural$1(tests, "test")}` : ""}`);
+			const tests = count$2(DECLARED, before) - reappear(titles(before));
+			if (tests > 0 || count$2(DECLARED, before) === 0) red.push(`deletes ${path}${tests ? ` and its ${plural$1(tests, "test")}` : ""}`);
 			continue;
 		}
-		const removed = count$2(DECLARED, before) - count$2(DECLARED, newText);
-		if (removed > 0) found.push(`removes ${plural$1(removed, "test")} from ${path}`);
-		const skipped = count$2(SKIPPED, newText) - count$2(SKIPPED, before);
-		if (skipped > 0) found.push(`skips ${plural$1(skipped, "test")} in ${path}`);
-		if (count$2(FOCUSED, newText) > count$2(FOCUSED, before)) found.push(`marks tests .only in ${path}, so the rest do not run`);
-		if (count$2(EXITS, newText) > count$2(EXITS, before)) found.push(`calls process.exit in ${path}`);
+		const fewer = count$2(DECLARED, before) - count$2(DECLARED, newText);
+		const removed = fewer > 0 ? fewer - Math.min(fewer, reappear(lostTitles(before, newText))) : 0;
+		if (removed > 0) red.push(`removes ${plural$1(removed, "test")} from ${path}`);
+		const skipped = bareSkips(newText) - bareSkips(before);
+		if (skipped > 0) red.push(`skips ${plural$1(skipped, "test")} in ${path}`);
+		const conditional = count$2(CONDITIONAL_SKIP, newText) - count$2(CONDITIONAL_SKIP, before);
+		if (conditional > 0) look.push(`skips ${conditional === 1 ? "a test" : `${conditional} tests`} in ${path} under a condition, and says why`);
+		if (count$2(FOCUSED, newText) > count$2(FOCUSED, before)) red.push(`marks tests .only in ${path}, so the rest do not run`);
+		if (count$2(EXITS, newText) > count$2(EXITS, before)) red.push(`calls process.exit in ${path}`);
 	}
-	return found;
+	return {
+		red,
+		look
+	};
 }
 // node_modules/@lezer/common/dist/index.js
 /**
@@ -154212,8 +154267,26 @@ const EXTENSIONS = [
 	".jsx",
 	".mjs",
 	".cjs",
-	".json"
+	".mts",
+	".cts",
+	".json",
+	".d.ts"
 ];
+/**
+* TypeScript written as ES modules imports `./x.js` for the source file
+* `x.ts`: the compiled name, which is the one Node will load. These are the
+* sources each compiled extension stands for.
+*/
+const SOURCE_FOR = {
+	".js": [
+		".ts",
+		".tsx",
+		".d.ts"
+	],
+	".jsx": [".tsx"],
+	".mjs": [".mts", ".d.mts"],
+	".cjs": [".cts", ".d.cts"]
+};
 /** Subtrees whose definitions are locals, not exports. */
 const OPAQUE = /* @__PURE__ */ new Set([
 	"Block",
@@ -154380,6 +154453,7 @@ function readExports(path, text) {
 			if (node.name === "ExportDeclaration") inExport -= 1;
 		}
 	});
+	for (const list of text.matchAll(/\bexport\s+(?:type\s+)?(\{[^}]*\})/g)) for (const name of groupNames(list[1], "right")) names.add(name);
 	return {
 		names,
 		unknown: unknownShape
@@ -154390,6 +154464,16 @@ function dirOf(path) {
 	return cut === -1 ? "" : path.slice(0, cut);
 }
 /** Join and flatten `.`/`..` without touching the host filesystem. */
+/** Whether `rel`, taken from the folder `base`, climbs above the project's root. */
+function escapesRoot(base, rel) {
+	let depth = 0;
+	for (const part of `${base}/${rel}`.split("/")) {
+		if (part === "" || part === ".") continue;
+		depth += part === ".." ? -1 : 1;
+		if (depth < 0) return true;
+	}
+	return false;
+}
 function joinPath(base, rel) {
 	const out = [];
 	for (const part of `${base}/${rel}`.split("/")) {
@@ -154423,6 +154507,11 @@ function resolveInWorkspace(candidate, files) {
 		const withExt = `${candidate}${ext}`;
 		if (files[withExt] !== void 0) return withExt;
 	}
+	const compiled = /\.(?:m|c)?jsx?$/.exec(candidate)?.[0];
+	if (compiled) {
+		const stem = candidate.slice(0, -compiled.length);
+		for (const ext of SOURCE_FOR[compiled] ?? []) if (files[`${stem}${ext}`] !== void 0) return `${stem}${ext}`;
+	}
 	for (const ext of EXTENSIONS.slice(1)) {
 		const index = `${candidate}/index${ext}`;
 		if (files[index] !== void 0) return index;
@@ -154433,6 +154522,7 @@ function resolveSpecifier(fromPath, rawSpec, files) {
 	const spec = rawSpec.split("?")[0];
 	if (!spec) return { kind: "unknown" };
 	if (spec.startsWith(".")) {
+		if (escapesRoot(dirOf(fromPath), spec)) return { kind: "unknown" };
 		const hit = resolveInWorkspace(joinPath(dirOf(fromPath), spec), files);
 		return hit ? {
 			kind: "file",
@@ -154447,7 +154537,8 @@ function resolveSpecifier(fromPath, rawSpec, files) {
 			path: hit
 		} : { kind: "missing" };
 	}
-	if (spec.startsWith("node:") || NODE_BUILTINS.has(spec)) return { kind: "unknown" };
+	if (spec.startsWith("node:") || NODE_BUILTINS.has(spec.split("/")[0])) return { kind: "unknown" };
+	if (spec.startsWith("#")) return { kind: "unknown" };
 	if (spec.startsWith("/") || /^[a-z]+:/i.test(spec)) return { kind: "unknown" };
 	if (spec.startsWith("@/")) return { kind: "unknown" };
 	return {
@@ -154455,32 +154546,62 @@ function resolveSpecifier(fromPath, rawSpec, files) {
 		pkg: spec.startsWith("@") ? spec.split("/").slice(0, 2).join("/") : spec.split("/")[0]
 	};
 }
-function declaredPackages(files) {
-	const raw = files["package.json"];
-	if (!raw) return null;
-	try {
-		const pkg = JSON.parse(raw);
-		const names = [
-			...Object.keys(pkg.dependencies ?? {}),
-			...Object.keys(pkg.devDependencies ?? {}),
-			...Object.keys(pkg.peerDependencies ?? {}),
-			...Object.keys(pkg.optionalDependencies ?? {})
-		];
-		return new Set(names);
-	} catch {
-		return null;
+/**
+* Every package the project can import: the dependencies of every
+* `package.json` in it (a monorepo hoists them to where any package can reach
+* them), the names of its own workspace packages, and those `outside` it (the
+* `package.json` files above a package checked on its own). Null when the
+* project has no `package.json`: then nothing is known, and nothing is judged.
+*/
+const declaredMemo = /* @__PURE__ */ new WeakMap();
+function declaredPackages(files, outside = []) {
+	const texts = [];
+	for (const [path, raw] of Object.entries(files)) if ((path === "package.json" || path.endsWith("/package.json")) && !path.includes("node_modules/")) texts.push(raw);
+	const hit = declaredMemo.get(files);
+	let names;
+	if (hit && hit.texts.length === texts.length && hit.texts.every((t, i) => t === texts[i])) names = hit.names;
+	else {
+		names = null;
+		for (const raw of texts) try {
+			const pkg = JSON.parse(raw);
+			names ??= /* @__PURE__ */ new Set();
+			if (typeof pkg.name === "string") names.add(pkg.name);
+			for (const field of [
+				"dependencies",
+				"devDependencies",
+				"peerDependencies",
+				"optionalDependencies"
+			]) {
+				const deps = pkg[field];
+				if (deps && typeof deps === "object") for (const name of Object.keys(deps)) names.add(name);
+			}
+		} catch {}
+		declaredMemo.set(files, {
+			texts,
+			names
+		});
 	}
+	if (!names) return null;
+	return outside.length === 0 ? names : /* @__PURE__ */ new Set([...names, ...outside]);
+}
+/** A package counts as declared through its types too: `vscode` comes with `@types/vscode`, `@a/b` with `@types/a__b`. */
+function isDeclared(pkg, names) {
+	if (names.has(pkg)) return true;
+	const types = pkg.startsWith("@") ? `@types/${pkg.slice(1).replace("/", "__")}` : `@types/${pkg}`;
+	return names.has(types);
 }
 /**
 * Problems with what `path` imports, given the snapshot it will live in.
 *
 * Silent when it cannot be sure: no `package.json` means bare specifiers go
 * unchecked, and a target whose exports cannot be enumerated skips name checks.
+* `outside` names packages declared above the project's root (see
+* `declaredPackages`).
 */
-function importIssues(path, files) {
+function importIssues(path, files, outside = []) {
 	const text = files[path];
 	if (text === void 0 || !isScriptPath(path)) return [];
-	const packages = declaredPackages(files);
+	const packages = declaredPackages(files, outside);
 	const issues = [];
 	for (const ref of collectImports(path, text)) {
 		if (ref.guarded) continue;
@@ -154490,7 +154611,7 @@ function importIssues(path, files) {
 			continue;
 		}
 		if (resolved.kind === "external") {
-			if (packages && !packages.has(resolved.pkg)) issues.push(`${ref.require ? "requires" : "imports"} "${resolved.pkg}" at line ${ref.line}, which is not in package.json`);
+			if (packages && !isDeclared(resolved.pkg, packages)) issues.push(`${ref.require ? "requires" : "imports"} "${resolved.pkg}" at line ${ref.line}, which is not in package.json`);
 			continue;
 		}
 		if (resolved.kind !== "file" || ref.names.length === 0) continue;
@@ -155559,7 +155680,7 @@ function changeChecks(input) {
 		detail: `${plural(checkable.length, "file")} ${checkable.length === 1 ? "parses" : "parse"}.`
 	};
 	const parsed = scripts.filter((p) => !broken.some((r) => r.path === p));
-	const unresolved = judgedRow("imports", "Imports resolve", judged(parsed, (path, set) => importIssues(path, set), snapshot, files), snapshot);
+	const unresolved = judgedRow("imports", "Imports resolve", judged(parsed, (path, set) => importIssues(path, set, input.outsidePackages), snapshot, files), snapshot);
 	const imports = scripts.length === 0 ? {
 		id: "imports",
 		label: "Imports resolve",
@@ -155639,7 +155760,7 @@ function changeChecks(input) {
 			status: "pass",
 			detail: "The staged page renders with no errors."
 		},
-		tamperedRow(testsRow(verify ?? null, input.browser ?? null), testTampering(files, edits)),
+		tamperedRow(testsRow(verify ?? null, input.browser ?? null), testChanges(files, edits)),
 		safetyRow(safetyFindings(files, edits)),
 		...(input.hooks ?? []).map(hookRow),
 		...skillRows(verify ?? null)
@@ -155712,8 +155833,16 @@ function skillRows(verify) {
 * it is judged by, so the row is red whatever the run said. The person can
 * still choose Apply anyway when that is what they asked for.
 */
-function tamperedRow(row, tampering) {
-	if (tampering.length === 0) return row;
+function tamperedRow(row, changes) {
+	const tampering = changes.red;
+	if (tampering.length === 0) {
+		if (changes.look.length === 0 || row.status === "fail" || row.status === "running") return row;
+		return {
+			...row,
+			status: "warn",
+			detail: `Worth a look: this change ${changes.look.join("; ")}. ${row.detail}`
+		};
+	}
 	const ran = row.status === "pass" || row.status === "fail" ? ` (${row.detail})` : "";
 	return {
 		id: "tests",
@@ -155941,9 +156070,10 @@ declare var __dirname: string, __filename: string, global: any;
 * runner's, a `NodeJS.` namespace. They would fail every Node project here,
 * and installing the package would make them go away.
 */
-function missingPackageTypes(diagnostic, text) {
+function missingPackageTypes(diagnostic, text, from) {
 	if (diagnostic.code === 2307 || diagnostic.code === 2792) {
 		const name = /module '([^']+)'/.exec(text)?.[1] ?? "";
+		if (name.startsWith(".") && from !== void 0) return climbsOut(from, name);
 		return name !== "" && !name.startsWith(".") && !name.startsWith("/");
 	}
 	if ([
@@ -155956,6 +156086,16 @@ function missingPackageTypes(diagnostic, text) {
 		7016
 	].includes(diagnostic.code)) return true;
 	return diagnostic.code === 2503 && /'NodeJS'/.test(text);
+}
+/** Whether `spec`, imported from the file `from`, points above the project's root. */
+function climbsOut(from, spec) {
+	let depth = from.split("/").length - 1;
+	for (const part of spec.split("/")) {
+		if (part === "" || part === ".") continue;
+		depth += part === ".." ? -1 : 1;
+		if (depth < 0) return true;
+	}
+	return false;
 }
 const DEFAULTS$1 = {
 	target: "ES2022",
@@ -156070,7 +156210,7 @@ function checkProject(ts, files, paths, libs, options, cache = /* @__PURE__ */ n
 		const rows = [];
 		for (const diagnostic of found) {
 			const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, " ");
-			if (missingPackageTypes(diagnostic, message)) continue;
+			if (missingPackageTypes(diagnostic, message, path)) continue;
 			const line = diagnostic.start === void 0 ? 1 : file.getLineAndCharacterOfPosition(diagnostic.start).line + 1;
 			const syntax = syntactic.includes(diagnostic) ? { syntax: true } : {};
 			rows.push({
@@ -156173,12 +156313,12 @@ function editsFor(before, changes, description) {
 * The Imports row with what deleting files broke: an import of a deleted file,
 * in a file that still exists, that resolved before the change.
 */
-function withDeletedImports(rows, importers, before, after) {
+function withDeletedImports(rows, importers, before, after, outside = []) {
 	const broken = importers.map((path) => {
-		const was = new Set(importIssues(path, before));
+		const was = new Set(importIssues(path, before, outside));
 		return {
 			path,
-			issues: importIssues(path, after).filter((issue) => !was.has(issue))
+			issues: importIssues(path, after, outside).filter((issue) => !was.has(issue))
 		};
 	}).filter((row) => row.issues.length > 0);
 	if (broken.length === 0) return rows;
@@ -156239,8 +156379,9 @@ function staticChangeChecks(input) {
 		render: null,
 		browser: input.tests,
 		tsc: tscCheck,
-		parse: tsParseCheck(input.tsc)
-	}), importers, input.before, after);
+		parse: tsParseCheck(input.tsc),
+		...input.outsidePackages ? { outsidePackages: input.outsidePackages } : {}
+	}), importers, input.before, after, input.outsidePackages);
 	const others = input.safetyOnly ?? [];
 	if (others.length === 0) return checked;
 	const files = { ...input.before };
@@ -156316,6 +156457,14 @@ function git(args, cwd) {
 			"pipe"
 		]
 	});
+}
+/** Where `cwd` sits in its repository, e.g. `apps/web/`; empty at the root. GitHub annotations name files from the root. */
+function repoPrefix(cwd) {
+	try {
+		return git(["rev-parse", "--show-prefix"], cwd).trim();
+	} catch {
+		return "";
+	}
 }
 /** The commit the change grew from: where the base branch and this checkout meet. */
 function mergeBase(base, cwd) {
@@ -156491,6 +156640,7 @@ function loadProject(cwd, rev) {
 		deleted,
 		safetyOnly,
 		notChecked: changed.map((change) => change.path),
+		outsidePackages: [],
 		tooLarge: `The project has ${listed.length.toLocaleString("en-US")} files to read (${Math.round(total / 1e6)} MB); the limit is ${LOAD_LIMITS.files.toLocaleString("en-US")} files and ${LOAD_LIMITS.totalBytes / 1e6} MB.`
 	};
 	const before = readAt(rev, listed.map((file) => file.path), cwd);
@@ -156529,8 +156679,39 @@ function loadProject(cwd, rev) {
 		deleted,
 		safetyOnly,
 		notChecked,
-		tooLarge: null
+		tooLarge: null,
+		outsidePackages: outsidePackages(cwd, rev)
 	};
+}
+/** At most this many `package.json` files are read from the rest of the repository. */
+const OUTSIDE_LIMIT = 2e3;
+/** What every `package.json` outside `cwd` (in the same repository, at `rev`) declares; empty at the repository's root. */
+function outsidePackages(cwd, rev) {
+	const prefix = repoPrefix(cwd);
+	if (!prefix) return [];
+	const root = git(["rev-parse", "--show-toplevel"], cwd).trim();
+	const texts = readAt(rev, git([
+		"ls-tree",
+		"-r",
+		"--name-only",
+		"-z",
+		rev
+	], root).split("\0").filter((path) => (path === "package.json" || path.endsWith("/package.json")) && !path.startsWith(prefix) && !SKIPPED_DIR$1.test(path)).slice(0, OUTSIDE_LIMIT), root);
+	const names = /* @__PURE__ */ new Set();
+	for (const raw of Object.values(texts)) try {
+		const pkg = JSON.parse(raw);
+		if (typeof pkg.name === "string") names.add(pkg.name);
+		for (const field of [
+			"dependencies",
+			"devDependencies",
+			"peerDependencies",
+			"optionalDependencies"
+		]) {
+			const deps = pkg[field];
+			if (deps && typeof deps === "object") for (const name of Object.keys(deps)) names.add(name);
+		}
+	} catch {}
+	return [...names].sort();
 }
 /** A changed file that is not code, as Safety reads it; null when it is binary or too big to read. */
 function readOther(cwd, change, base) {
@@ -156858,7 +157039,8 @@ function check(options) {
 		description: "Pull request",
 		tscLimits: RUNNER_TSC_LIMITS,
 		installed: installedFiles(options.cwd),
-		safetyOnly: others
+		safetyOnly: others,
+		outsidePackages: project.outsidePackages
 	}));
 	const result = verdict(rows);
 	return {
