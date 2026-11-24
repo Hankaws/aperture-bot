@@ -155276,6 +155276,882 @@ function excerpt(text, line, around = 2) {
 	for (let n = from; n <= to; n++) out.push(`${n === line ? ">" : " "} ${String(n).padStart(width)} | ${lines[n - 1]}`);
 	return out.join("\n");
 }
+// src/lib/runner/config.ts
+const CONFIG_EXT = [
+	"ts",
+	"mts",
+	"cts",
+	"js",
+	"mjs",
+	"cjs"
+];
+/** Vitest keys the runner honours or that change nothing about a single run. */
+const VITEST_KEYS = /* @__PURE__ */ new Set([
+	"test",
+	"globals",
+	"environment",
+	"include",
+	"exclude",
+	"testTimeout",
+	"hookTimeout",
+	"passWithNoTests",
+	"reporters",
+	"reporter",
+	"watch",
+	"clearMocks",
+	"mockReset",
+	"restoreMocks",
+	"isolate",
+	"pool",
+	"fileParallelism",
+	"silent",
+	"css",
+	"unstubGlobals",
+	"unstubEnvs",
+	"coverage",
+	"provider",
+	"reportsDirectory",
+	"all",
+	"enabled",
+	"clean"
+]);
+/** Vite keys a Vitest run ignores (dev server, production build). */
+const VITE_ONLY_KEYS = /* @__PURE__ */ new Set([
+	"server",
+	"preview",
+	"build",
+	"base",
+	"publicDir",
+	"clearScreen",
+	"logLevel",
+	"port",
+	"host",
+	"open",
+	"outDir",
+	"sourcemap"
+]);
+const JEST_KEYS = /* @__PURE__ */ new Set([
+	"testEnvironment",
+	"testMatch",
+	"testRegex",
+	"testPathIgnorePatterns",
+	"moduleFileExtensions",
+	"clearMocks",
+	"resetMocks",
+	"restoreMocks",
+	"verbose",
+	"testTimeout",
+	"bail",
+	"preset",
+	"transform",
+	"collectCoverageFrom",
+	"coverageDirectory",
+	"coverageReporters",
+	"coverageThreshold",
+	"coverageProvider",
+	"coveragePathIgnorePatterns",
+	"watchPathIgnorePatterns",
+	"maxWorkers",
+	"passWithNoTests",
+	"displayName",
+	"notify",
+	"errorOnDeprecated",
+	"injectGlobals",
+	"silent",
+	"roots",
+	"global",
+	"branches",
+	"functions",
+	"lines",
+	"statements",
+	"tsconfig",
+	"isolatedModules",
+	"diagnostics",
+	"useESM"
+]);
+/** Transformers that only strip types or compile JSX, which the runner does itself. */
+const PLAIN_TRANSFORMERS = /^(ts-jest|babel-jest|@swc\/jest|esbuild-jest|@sucrase\/jest-plugin|sucrase-jest)$/;
+/**
+* What a config may import: the config helpers, and plugins that only compile
+* JSX or CSS. The runner compiles JSX itself, and a test that loads CSS is
+* unsupported anyway.
+*/
+const CONFIG_IMPORTS = /^(vitest\/config|vitest|vite|@jest\/types|jest|ts-jest|@vitejs\/plugin-react(-swc)?|@tailwindcss\/vite)$/;
+function stripComments(source) {
+	let out = "";
+	let quote = null;
+	for (let i = 0; i < source.length; i++) {
+		const c = source[i];
+		if (quote) {
+			out += c;
+			if (c === "\\") out += source[++i] ?? "";
+			else if (c === quote) quote = null;
+		} else if (c === "\"" || c === "'" || c === "`") {
+			quote = c;
+			out += c;
+		} else if (c === "/" && source[i + 1] === "/") {
+			while (i < source.length && source[i] !== "\n") i++;
+			out += "\n";
+		} else if (c === "/" && source[i + 1] === "*") {
+			const end = source.indexOf("*/", i + 2);
+			i = end < 0 ? source.length : end + 1;
+		} else out += c;
+	}
+	return out;
+}
+/** Drops `key: { … }` so its nested keys (coverage's own `include`) are not read as the test settings. */
+function withoutBlock(source, key) {
+	const m = new RegExp(`\\b${key}\\s*:\\s*\\{`).exec(source);
+	if (!m) return source;
+	let depth = 0;
+	for (let i = m.index + m[0].length - 1; i < source.length; i++) if (source[i] === "{") depth++;
+	else if (source[i] === "}" && --depth === 0) return source.slice(0, m.index) + source.slice(i + 1);
+	return source;
+}
+function stringList(source, key) {
+	const m = source.match(new RegExp(`\\b${key}\\s*:\\s*\\[([^\\]]*)\\]`));
+	if (!m) {
+		const single = source.match(new RegExp(`\\b${key}\\s*:\\s*(["'\`])([^"'\`]*)\\1`));
+		return single ? [single[2]] : null;
+	}
+	return [...m[1].matchAll(/(["'`])((?:\\.|(?!\1).)*)\1/g)].map((s) => s[2].replace(/\\\\/g, "\\"));
+}
+function stringValue(source, key) {
+	const m = source.match(new RegExp(`\\b${key}\\s*:\\s*(["'\`])([^"'\`]*)\\1`));
+	return m ? m[2] : null;
+}
+function isTrue(source, key) {
+	return new RegExp(`\\b${key}\\s*:\\s*true\\b`).test(source);
+}
+function numberValue(source, key) {
+	const m = source.match(new RegExp(`\\b${key}\\s*:\\s*([\\d_]+)`));
+	return m ? Number(m[1].replace(/_/g, "")) : null;
+}
+/** Object keys a JS config sets, quoted or bare. Imprecise on purpose: an unknown word refuses, never accepts. */
+function keysOf(source) {
+	const keys = [];
+	for (const m of source.matchAll(/(?:(["'])([A-Za-z_$][\w$-]*)\1|(?<![\w$.?"'])([A-Za-z_$][\w$]*))\s*:(?!:)/g)) keys.push(m[2] ?? m[3]);
+	return keys;
+}
+function importsOf(source) {
+	const specs = [];
+	for (const m of source.matchAll(/\bfrom\s*(["'])([^"']+)\1|\bimport\s*(["'])([^"']+)\3|\brequire\(\s*(["'])([^"']+)\5\s*\)/g)) specs.push(m[2] ?? m[4] ?? m[6]);
+	return specs;
+}
+function findFile(files, stems) {
+	for (const stem of stems) for (const ext of CONFIG_EXT) if (files[`${stem}.${ext}`] !== void 0) return `${stem}.${ext}`;
+	return null;
+}
+/**
+* Glob to RegExp, with the extglob and class syntax Vitest and Jest defaults use:
+* `**`, `*`, `?`, `{a,b}`, `[jt]`, `?(x)`, `+(a|b)`, `*(x)`, `@(x)`.
+*/
+function testGlobToRegExp(glob) {
+	let out = "";
+	const src = glob.replace(/^<rootDir>\//, "").replace(/^\.\//, "");
+	for (let i = 0; i < src.length; i++) {
+		const c = src[i];
+		const next = src[i + 1];
+		if ((c === "?" || c === "+" || c === "*" || c === "@") && next === "(") {
+			const end = src.indexOf(")", i);
+			if (end > i) {
+				const body = src.slice(i + 2, end).split("|").map((part) => testGlobToRegExp(part).source.slice(1, -1)).join("|");
+				out += `(?:${body})${c === "@" ? "" : c}`;
+				i = end;
+				continue;
+			}
+		}
+		if (c === "*" && next === "*") {
+			if (src[i + 2] === "/") {
+				out += "(?:.*/)?";
+				i += 2;
+			} else {
+				out += ".*";
+				i += 1;
+			}
+		} else if (c === "*") out += "[^/]*";
+		else if (c === "?") out += "[^/]";
+		else if (c === "[") {
+			const end = src.indexOf("]", i);
+			if (end < 0) out += "\\[";
+			else {
+				out += `[${src.slice(i + 1, end).replace(/^!/, "^").replace(/\\/g, "\\\\")}]`;
+				i = end;
+			}
+		} else if (c === "{") {
+			const end = src.indexOf("}", i);
+			if (end < 0) {
+				out += "\\{";
+				continue;
+			}
+			out += `(?:${src.slice(i + 1, end).split(",").map((part) => testGlobToRegExp(part).source.slice(1, -1)).join("|")})`;
+			i = end;
+		} else out += c.replace(/[.+^$()|\]\\]/g, "\\$&");
+	}
+	return new RegExp(`^${out}$`);
+}
+const DEFAULTS$1 = {
+	source: null,
+	globals: false,
+	include: null,
+	exclude: [],
+	testTimeout: null,
+	clearMocks: false,
+	resetMocks: false,
+	restoreMocks: false
+};
+function refuse(file, what) {
+	return {
+		ok: false,
+		reason: `${file} ${what}, which the browser runner does not support.`
+	};
+}
+function checkImports(file, source) {
+	const other = importsOf(source).find((spec) => !CONFIG_IMPORTS.test(spec));
+	return other ? refuse(file, `imports ${other}`) : null;
+}
+function readVitestConfig(files) {
+	if (findFile(files, ["vitest.workspace", "vitest.projects"])) return {
+		ok: false,
+		reason: "A Vitest workspace runs several projects, which the browser runner does not support."
+	};
+	const file = findFile(files, ["vitest.config", "vite.config"]);
+	if (!file) return {
+		ok: true,
+		...DEFAULTS$1
+	};
+	const source = stripComments(files[file]);
+	const bad = checkImports(file, source);
+	if (bad) return bad;
+	const isVite = file.startsWith("vite.");
+	for (const key of keysOf(source)) {
+		if (VITEST_KEYS.has(key)) continue;
+		if (key === "plugins" || isVite && VITE_ONLY_KEYS.has(key)) continue;
+		return refuse(file, `sets ${key}`);
+	}
+	const settings = withoutBlock(source, "coverage");
+	const environment = stringValue(settings, "environment");
+	if (environment && environment !== "node") return refuse(file, `runs tests in a ${environment} environment`);
+	const include = stringList(settings, "include");
+	const exclude = stringList(settings, "exclude");
+	return {
+		ok: true,
+		source: file,
+		globals: isTrue(settings, "globals"),
+		include: include ? include.map(testGlobToRegExp) : null,
+		exclude: (exclude ?? []).map(testGlobToRegExp),
+		testTimeout: numberValue(settings, "testTimeout"),
+		clearMocks: isTrue(settings, "clearMocks"),
+		resetMocks: isTrue(settings, "mockReset"),
+		restoreMocks: isTrue(settings, "restoreMocks")
+	};
+}
+function jestFromObject(file, config) {
+	for (const key of Object.keys(config)) if (!JEST_KEYS.has(key)) return refuse(file, `sets ${key}`);
+	const env = config.testEnvironment;
+	if (env !== void 0 && env !== "node") return refuse(file, `runs tests in a ${String(env)} environment`);
+	if (config.preset !== void 0 && !/^ts-jest(\/.*)?$/.test(String(config.preset))) return refuse(file, `uses the ${String(config.preset)} preset`);
+	if (config.transform !== void 0) {
+		const other = Object.values(config.transform ?? {}).map((v) => Array.isArray(v) ? v[0] : v).find((v) => !PLAIN_TRANSFORMERS.test(String(v)));
+		if (other !== void 0) return refuse(file, `transforms files with ${String(other)}`);
+	}
+	if (config.roots !== void 0) {
+		if ((Array.isArray(config.roots) ? config.roots : []).map(String).some((r) => r !== "<rootDir>" && !r.startsWith("<rootDir>/"))) return refuse(file, "sets roots outside the project");
+	}
+	const list = (v) => Array.isArray(v) ? v.map(String) : typeof v === "string" ? [v] : null;
+	const match = list(config.testMatch);
+	const regex = list(config.testRegex);
+	let include = null;
+	try {
+		if (match) include = match.map(testGlobToRegExp);
+		else if (regex) include = regex.map((r) => new RegExp(r));
+	} catch {
+		return refuse(file, "sets a testRegex that is not a valid regular expression");
+	}
+	const ignore = list(config.testPathIgnorePatterns) ?? [];
+	const exclude = [];
+	for (const pattern of ignore) try {
+		exclude.push(new RegExp(pattern.replace(/<rootDir>\/?/g, "")));
+	} catch {
+		return refuse(file, "sets a testPathIgnorePatterns entry that is not a valid regular expression");
+	}
+	return {
+		ok: true,
+		source: file,
+		globals: config.injectGlobals !== false,
+		include,
+		exclude,
+		testTimeout: typeof config.testTimeout === "number" ? config.testTimeout : null,
+		clearMocks: config.clearMocks === true,
+		resetMocks: config.resetMocks === true,
+		restoreMocks: config.restoreMocks === true
+	};
+}
+/** A JS Jest config read as far as a regex can: keys, plus the few values the runner uses. */
+function jestFromSource(file, raw) {
+	const source = stripComments(raw);
+	const bad = checkImports(file, source);
+	if (bad) return bad;
+	const config = {};
+	for (const key of keysOf(source)) config[key] = true;
+	const transform = source.match(/\btransform\s*:\s*\{([^}]*)\}/);
+	if (transform) config.transform = Object.fromEntries([...transform[1].matchAll(/(["'])(?:\\.|(?!\1).)*\1\s*:\s*\[?\s*(["'])([^"']+)\2/g)].map((m, i) => [String(i), m[3]]));
+	for (const key of ["testEnvironment", "preset"]) if (key in config) config[key] = stringValue(source, key) ?? "(computed)";
+	for (const key of [
+		"testMatch",
+		"testRegex",
+		"testPathIgnorePatterns",
+		"roots"
+	]) if (key in config) config[key] = stringList(source, key) ?? ["(computed)"];
+	if ("testTimeout" in config) config.testTimeout = numberValue(source, "testTimeout") ?? void 0;
+	for (const key of [
+		"clearMocks",
+		"resetMocks",
+		"restoreMocks",
+		"injectGlobals"
+	]) if (key in config) config[key] = new RegExp(`\\b${key}\\s*:\\s*false\\b`).test(source) ? false : isTrue(source, key);
+	for (const key of ["exports", "default"]) delete config[key];
+	return jestFromObject(file, config);
+}
+function readJestConfig(files) {
+	const file = findFile(files, ["jest.config"]);
+	if (file) return jestFromSource(file, files[file]);
+	if (files["jest.config.json"] !== void 0) try {
+		return jestFromObject("jest.config.json", JSON.parse(files["jest.config.json"]));
+	} catch {
+		return {
+			ok: false,
+			reason: "jest.config.json is not valid JSON."
+		};
+	}
+	try {
+		const pkg = JSON.parse(files["package.json"] ?? "{}");
+		if (pkg.jest && typeof pkg.jest === "object") return jestFromObject("package.json's jest field", pkg.jest);
+	} catch {}
+	return {
+		ok: true,
+		...DEFAULTS$1,
+		globals: true
+	};
+}
+function readTestConfig(files, framework) {
+	return framework === "vitest" ? readVitestConfig(files) : readJestConfig(files);
+}
+// src/lib/runner/plan.ts
+/**
+* Which files `npm run <script>` would run, when the browser can run them.
+*
+* Only the shapes a browser can honour: `node [flags] files…`, `node --test
+* [files or globs]` and `tsx files…`, chained with `&&`; and `vitest` or
+* `jest` with a config that asks for nothing beyond picking files (see
+* `config.ts`). Anything else (a build step, a DOM environment, plugins)
+* needs a real Node, and the answer says so rather than guessing.
+*/
+const NODE_OPTIONS = {
+	globals: false,
+	namePattern: null,
+	testTimeout: null,
+	clearMocks: false,
+	resetMocks: false,
+	restoreMocks: false
+};
+/** Flags that change nothing about what runs, or that this runner provides anyway. */
+const HARMLESS_FLAGS = /^--(experimental-strip-types|experimental-transform-types|no-warnings|enable-source-maps|test|test-reporter(=.*)?|test-concurrency(=.*)?|test-timeout(=.*)?|no-experimental-fetch|trace-warnings|disable-warning(=.*)?)$/;
+const CODE_EXT$1 = "(c|m)?(j|t)s";
+/** `node --test` with no files: Node's own default patterns. */
+const DEFAULT_TEST_FILES = new RegExp(`(^|/)(test|[^/]*[._-]test|test-[^/]*)\\.${CODE_EXT$1}$|(^|/)test/.+\\.${CODE_EXT$1}$`);
+function globToRegExp(glob) {
+	let out = "";
+	for (let i = 0; i < glob.length; i++) {
+		const c = glob[i];
+		if (c === "*" && glob[i + 1] === "*") {
+			if (glob[i + 2] === "/") {
+				out += "(?:.*/)?";
+				i += 2;
+			} else {
+				out += ".*";
+				i += 1;
+			}
+		} else if (c === "*") out += "[^/]*";
+		else if (c === "?") out += "[^/]";
+		else if (c === "{") {
+			const end = glob.indexOf("}", i);
+			if (end < 0) {
+				out += "\\{";
+				continue;
+			}
+			out += `(?:${glob.slice(i + 1, end).split(",").map((part) => part.replace(/[.+^$()|[\]\\]/g, "\\$&")).join("|")})`;
+			i = end;
+		} else out += c.replace(/[.+^$()|[\]\\]/g, "\\$&");
+	}
+	return new RegExp(`^${out}$`);
+}
+function words(command) {
+	return (command.match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map((w) => w.replace(/^(["'])(.*)\1$/, "$2"));
+}
+function cleanPath(path) {
+	return path.replace(/^\.\//, "").replace(/\/+$/, "");
+}
+function projectFiles(files) {
+	return Object.keys(files).filter((p) => !p.split("/").includes("node_modules")).sort();
+}
+const VITEST_DEFAULT = [testGlobToRegExp("**/*.{test,spec}.?(c|m)[jt]s?(x)")];
+const VITEST_EXCLUDE = /(^|\/)(dist|cypress|\.(idea|git|cache|output|temp))\/|(^|\/)(karma|rollup|webpack|vite|vitest|jest|ava|babel|nyc|cypress|tsup|build|eslint|prettier)\.config\./;
+const JEST_DEFAULT = [testGlobToRegExp("**/__tests__/**/*.[jt]s?(x)"), testGlobToRegExp("**/?(*.)+(spec|test).[jt]s?(x)")];
+const envNode = (value) => value === "node" ? null : `runs tests in a ${value} environment`;
+const VITEST_FLAGS = {
+	"--run": { takesValue: false },
+	"--watch": { takesValue: false },
+	"--no-watch": { takesValue: false },
+	"--globals": { takesValue: false },
+	"--passWithNoTests": { takesValue: false },
+	"--silent": { takesValue: false },
+	"--color": { takesValue: false },
+	"--no-color": { takesValue: false },
+	"--coverage": { takesValue: false },
+	"--no-coverage": { takesValue: false },
+	"--isolate": { takesValue: false },
+	"--no-isolate": { takesValue: false },
+	"--no-file-parallelism": { takesValue: false },
+	"--allowOnly": { takesValue: false },
+	"--clearMocks": { takesValue: false },
+	"--mockReset": { takesValue: false },
+	"--restoreMocks": { takesValue: false },
+	"--reporter": { takesValue: true },
+	"--outputFile": { takesValue: true },
+	"--pool": { takesValue: true },
+	"--bail": { takesValue: true },
+	"--maxWorkers": { takesValue: true },
+	"--minWorkers": { takesValue: true },
+	"--testTimeout": { takesValue: true },
+	"--hookTimeout": { takesValue: true },
+	"--environment": {
+		takesValue: true,
+		check: envNode
+	},
+	"--testNamePattern": { takesValue: true },
+	"-t": { takesValue: true },
+	"--config": "refuse",
+	"-c": "refuse",
+	"--root": "refuse",
+	"-r": "refuse",
+	"--dir": "refuse",
+	"--project": "refuse",
+	"--workspace": "refuse",
+	"--shard": "refuse",
+	"--typecheck": "refuse",
+	"--browser": "refuse",
+	"--dom": "refuse",
+	"--changed": "refuse",
+	"--update": "refuse",
+	"-u": "refuse"
+};
+const JEST_FLAGS = {
+	"--ci": { takesValue: false },
+	"--runInBand": { takesValue: false },
+	"-i": { takesValue: false },
+	"--verbose": { takesValue: false },
+	"--silent": { takesValue: false },
+	"--passWithNoTests": { takesValue: false },
+	"--colors": { takesValue: false },
+	"--no-colors": { takesValue: false },
+	"--no-cache": { takesValue: false },
+	"--detectOpenHandles": { takesValue: false },
+	"--forceExit": { takesValue: false },
+	"--watch": { takesValue: false },
+	"--watchAll": { takesValue: false },
+	"--no-watchman": { takesValue: false },
+	"--coverage": { takesValue: false },
+	"--clearMocks": { takesValue: false },
+	"--resetMocks": { takesValue: false },
+	"--restoreMocks": { takesValue: false },
+	"--errorOnDeprecated": { takesValue: false },
+	"--bail": { takesValue: false },
+	"--noStackTrace": { takesValue: false },
+	"--expand": { takesValue: false },
+	"--logHeapUsage": { takesValue: false },
+	"--useStderr": { takesValue: false },
+	"--testNamePattern": { takesValue: true },
+	"-t": { takesValue: true },
+	"--testTimeout": { takesValue: true },
+	"--maxWorkers": { takesValue: true },
+	"-w": { takesValue: true },
+	"--reporters": { takesValue: true },
+	"--coverageReporters": { takesValue: true },
+	"--env": {
+		takesValue: true,
+		check: envNode
+	},
+	"--testEnvironment": {
+		takesValue: true,
+		check: envNode
+	},
+	"--testPathPattern": { takesValue: true },
+	"--testPathPatterns": { takesValue: true },
+	"--testPathIgnorePatterns": { takesValue: true },
+	"--config": "refuse",
+	"-c": "refuse",
+	"--rootDir": "refuse",
+	"--roots": "refuse",
+	"--projects": "refuse",
+	"--selectProjects": "refuse",
+	"--shard": "refuse",
+	"--setupFiles": "refuse",
+	"--setupFilesAfterEnv": "refuse",
+	"--findRelatedTests": "refuse",
+	"--onlyChanged": "refuse",
+	"-o": "refuse",
+	"--changedSince": "refuse",
+	"--listTests": "refuse",
+	"--updateSnapshot": "refuse",
+	"-u": "refuse"
+};
+/** `node node_modules/.bin/jest …`, the usual way to run Jest with ES modules. */
+const FRAMEWORK_BIN = /^(?:\.\/)?node_modules\/(?:\.bin\/(jest|vitest)|(jest)\/bin\/jest\.js|(vitest)\/vitest\.mjs)$/;
+function hasDependency(files, name) {
+	try {
+		const pkg = JSON.parse(files["package.json"] ?? "{}");
+		return Boolean(pkg.devDependencies?.[name] ?? pkg.dependencies?.[name]);
+	} catch {
+		return false;
+	}
+}
+function parseFrameworkArgs(framework, args, script) {
+	const flags = framework === "vitest" ? VITEST_FLAGS : JEST_FLAGS;
+	const out = {
+		filters: [],
+		ignore: [],
+		namePattern: null,
+		globals: false
+	};
+	let rest = args;
+	if (framework === "vitest" && rest[0] && !rest[0].startsWith("-")) {
+		if ([
+			"run",
+			"watch",
+			"dev"
+		].includes(rest[0])) rest = rest.slice(1);
+		else if ([
+			"bench",
+			"typecheck",
+			"related",
+			"init",
+			"list"
+		].includes(rest[0])) return { reason: `\`npm run ${script}\` runs vitest ${rest[0]}, which the browser runner does not support.` };
+	}
+	for (let i = 0; i < rest.length; i++) {
+		const word = rest[i];
+		if (!word.startsWith("-")) {
+			out.filters.push(word);
+			continue;
+		}
+		const eq = word.indexOf("=");
+		const name = eq > 0 ? word.slice(0, eq) : word;
+		const base = name.replace(/\..*$/, "");
+		const spec = flags[name] ?? (base === "--coverage" ? flags["--coverage"] : void 0);
+		if (spec === void 0 || spec === "refuse") return { reason: `\`npm run ${script}\` passes ${name} to ${framework}, which the browser runner does not support.` };
+		let value = null;
+		if (eq > 0) value = word.slice(eq + 1);
+		else if (spec.takesValue) {
+			value = rest[i + 1] ?? null;
+			i++;
+			if (value === null) return { reason: `\`npm run ${script}\` passes ${name} without a value.` };
+		}
+		if (value !== null && spec.check) {
+			const problem = spec.check(value);
+			if (problem) return { reason: `\`npm run ${script}\` ${problem}, which the browser runner does not support.` };
+		}
+		if ((name === "-t" || name === "--testNamePattern") && value !== null) out.namePattern = value;
+		if ((name === "--testPathPattern" || name === "--testPathPatterns") && value !== null) out.filters.push(value);
+		if (name === "--testPathIgnorePatterns" && value !== null) out.ignore.push(value);
+		if (name === "--globals") out.globals = true;
+	}
+	return out;
+}
+function planFramework(files, framework, args, script) {
+	if (!hasDependency(files, framework)) return { reason: `\`npm run ${script}\` runs ${framework}, which package.json does not list as a dependency.` };
+	const parsed = parseFrameworkArgs(framework, args, script);
+	if ("reason" in parsed) return parsed;
+	const config = readTestConfig(files, framework);
+	if (!config.ok) return config;
+	if (parsed.namePattern !== null) try {
+		new RegExp(parsed.namePattern);
+	} catch {
+		return { reason: `\`npm run ${script}\` passes a test name pattern that is not a valid regular expression.` };
+	}
+	const include = config.include ?? (framework === "vitest" ? VITEST_DEFAULT : JEST_DEFAULT);
+	const matchPath = (re, path) => re.test(path) || framework === "jest" && re.test(`/${path}`);
+	let ignore;
+	try {
+		ignore = [...config.exclude, ...parsed.ignore.map((p) => new RegExp(p))];
+	} catch {
+		return { reason: `\`npm run ${script}\` passes an ignore pattern that is not a valid regular expression.` };
+	}
+	let entries = projectFiles(files).filter((p) => include.some((re) => matchPath(re, p)) && !ignore.some((re) => matchPath(re, p)) && !(framework === "vitest" && VITEST_EXCLUDE.test(p)));
+	if (parsed.filters.length) {
+		const filters = parsed.filters.map((f) => {
+			if (framework === "vitest") return (p) => p.includes(cleanPath(f));
+			try {
+				const re = new RegExp(f);
+				return (p) => re.test(`/${p}`);
+			} catch {
+				return (p) => p.includes(f);
+			}
+		});
+		entries = entries.filter((p) => filters.some((match) => match(p)));
+	}
+	return {
+		entries,
+		options: {
+			globals: framework === "jest" ? config.globals : config.globals || parsed.globals,
+			namePattern: parsed.namePattern,
+			testTimeout: config.testTimeout,
+			clearMocks: config.clearMocks || args.includes("--clearMocks"),
+			resetMocks: config.resetMocks || args.includes("--resetMocks") || args.includes("--mockReset"),
+			restoreMocks: config.restoreMocks || args.includes("--restoreMocks")
+		}
+	};
+}
+function planBrowserRun(files, script = "test") {
+	let scripts = {};
+	try {
+		scripts = JSON.parse(files["package.json"] ?? "{}").scripts ?? {};
+	} catch {
+		return {
+			ok: false,
+			reason: "package.json is not valid JSON."
+		};
+	}
+	const command = scripts[script];
+	if (typeof command !== "string" || !command.trim()) return {
+		ok: false,
+		reason: `package.json has no "${script}" script.`
+	};
+	const all = projectFiles(files);
+	const entries = [];
+	let framework = null;
+	let options = NODE_OPTIONS;
+	for (const segment of command.split("&&").map((s) => s.trim())) {
+		let argv = words(segment);
+		if (argv[0] === "cross-env") argv = argv.slice(1);
+		while (argv[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) argv = argv.slice(1);
+		if (argv[0] === "npx") argv = argv.slice(1);
+		while (argv[0] === "--no-install" || argv[0] === "--yes" || argv[0] === "-y") argv = argv.slice(1);
+		let bin = argv[0];
+		let rest = argv.slice(1);
+		if (bin === "node") {
+			const at = rest.findIndex((w) => !w.startsWith("-"));
+			const target = at >= 0 ? FRAMEWORK_BIN.exec(rest[at]) : null;
+			if (target) {
+				const unknown = rest.slice(0, at).filter((f) => f !== "--experimental-vm-modules").find((f) => !HARMLESS_FLAGS.test(f));
+				if (unknown) return {
+					ok: false,
+					reason: `\`npm run ${script}\` passes ${unknown} to Node, which the browser runner does not support.`
+				};
+				bin = target[1] ?? target[2] ?? target[3];
+				rest = rest.slice(at + 1);
+			}
+		}
+		if (bin === "vitest" || bin === "jest") {
+			if (framework !== null && framework !== bin) return {
+				ok: false,
+				reason: `\`npm run ${script}\` mixes ${framework} and ${bin}, which the browser runner does not support.`
+			};
+			framework = bin;
+			const planned = planFramework(files, bin, rest, script);
+			if ("reason" in planned) return {
+				ok: false,
+				reason: planned.reason
+			};
+			if (planned.entries.length === 0) return {
+				ok: false,
+				reason: `\`npm run ${script}\` matches no test files.`
+			};
+			options = planned.options;
+			for (const path of planned.entries) if (!entries.includes(path)) entries.push(path);
+			continue;
+		}
+		if (bin !== "node" && bin !== "tsx") return {
+			ok: false,
+			reason: `\`npm run ${script}\` runs ${bin ?? "nothing"}, which needs a real Node.`
+		};
+		if (framework !== null && framework !== "node") return {
+			ok: false,
+			reason: `\`npm run ${script}\` mixes ${framework} and ${bin}, which the browser runner does not support.`
+		};
+		framework = "node";
+		const flags = rest.filter((w) => w.startsWith("-"));
+		const unknown = flags.find((f) => !HARMLESS_FLAGS.test(f));
+		if (unknown) return {
+			ok: false,
+			reason: `\`npm run ${script}\` passes ${unknown} to Node, which the browser runner does not support.`
+		};
+		const args = rest.filter((w) => !w.startsWith("-"));
+		const testMode = flags.includes("--test");
+		if (!testMode && args.length !== 1) return {
+			ok: false,
+			reason: `\`${segment}\` does not name one file to run.`
+		};
+		const found = [];
+		if (args.length === 0) found.push(...all.filter((p) => DEFAULT_TEST_FILES.test(p)));
+		for (const arg of args) {
+			const path = cleanPath(arg);
+			if (/[*?{]/.test(path)) {
+				const re = globToRegExp(path);
+				found.push(...all.filter((p) => re.test(p)));
+			} else if (files[path] !== void 0) found.push(path);
+			else if (testMode && all.some((p) => p.startsWith(`${path}/`))) found.push(...all.filter((p) => p.startsWith(`${path}/`) && DEFAULT_TEST_FILES.test(p)));
+			else return {
+				ok: false,
+				reason: `\`npm run ${script}\` runs ${path}, which is not in the project.`
+			};
+		}
+		if (found.length === 0) return {
+			ok: false,
+			reason: `\`npm run ${script}\` matches no test files.`
+		};
+		for (const path of found) if (!entries.includes(path)) entries.push(path);
+	}
+	return {
+		ok: true,
+		script,
+		command,
+		entries,
+		framework: framework ?? "node",
+		options
+	};
+}
+/** Per rule, and for all the rules in one prompt. Rules are instructions, not documentation. */
+const RULE_LIMIT = {
+	chars: 2e3,
+	total: 6e3,
+	rules: 24
+};
+function isRulePath(path) {
+	return path.startsWith(".aperture/rules/") && /\.mdc?$/i.test(path) && !path.slice(16).includes("/");
+}
+function unquote$1(value) {
+	return value.trim().replace(/^(["'])(.*)\1$/, "$2").trim();
+}
+/** `a, b`, `"a, b"`, `"a", "b"` and `[a, "b"]` all name the same two patterns. */
+function splitGlobs(value) {
+	let inner = value.trim().replace(/^\[(.*)\]$/, "$1").trim();
+	const whole = /^(["'])([^"']*)\1$/.exec(inner);
+	if (whole) inner = whole[2];
+	return (inner.match(/"[^"]*"|'[^']*'|[^,]+/g) ?? []).map(unquote$1).filter(Boolean);
+}
+/** Front matter, then the rule. A file without front matter is a rule for every turn. */
+function parseRule(path, raw) {
+	const text = raw.replace(/\r\n/g, "\n");
+	const front = /^---\n([\s\S]*?)\n---[ \t]*(?:\n|$)/.exec(text);
+	const body = (front ? text.slice(front[0].length) : text).trim();
+	if (!body) return null;
+	const globs = [];
+	let description = "";
+	let always = false;
+	if (front) {
+		const lines = front[1].split("\n");
+		for (let i = 0; i < lines.length; i++) {
+			const match = /^([A-Za-z]+)\s*:\s*(.*)$/.exec(lines[i]);
+			if (!match) continue;
+			const key = match[1].toLowerCase();
+			const value = match[2];
+			if (key === "files" || key === "globs") {
+				if (value.trim()) globs.push(...splitGlobs(value));
+				while (i + 1 < lines.length && /^\s*-\s+/.test(lines[i + 1])) {
+					globs.push(unquote$1(lines[i + 1].replace(/^\s*-\s+/, "")));
+					i += 1;
+				}
+			} else if (key === "description") description = unquote$1(value);
+			else if (key === "alwaysapply") always = unquote$1(value) === "true";
+		}
+	}
+	return {
+		path,
+		globs: always ? [] : [...new Set(globs.filter(Boolean))],
+		description,
+		text: body.length > RULE_LIMIT.chars ? `${body.slice(0, RULE_LIMIT.chars)}\n… (rule cut at ${RULE_LIMIT.chars} characters)` : body
+	};
+}
+/** Every rule in `.aperture/rules/`, by file name. */
+function scopedRules(files) {
+	return Object.keys(files).filter(isRulePath).sort().slice(0, RULE_LIMIT.rules).map((path) => parseRule(path, files[path] ?? "")).filter((rule) => rule !== null);
+}
+const compiled = /* @__PURE__ */ new Map();
+function globMatches(glob, path) {
+	const clean = glob.replace(/^\.?\//, "");
+	if (!clean) return false;
+	let re = compiled.get(clean);
+	if (!re) {
+		re = globToRegExp(clean.endsWith("/") ? `${clean}**` : clean);
+		compiled.set(clean, re);
+	}
+	if (re.test(path)) return true;
+	return !clean.includes("/") && re.test(path.split("/").pop() ?? path);
+}
+/** The first path a rule is for, or null. A rule for every turn matches without a path. */
+function ruleMatch(rule, paths) {
+	for (const path of paths) if (rule.globs.some((glob) => globMatches(glob, path))) return path;
+	return null;
+}
+/** Rules for every turn, and the rules for any of these files. */
+function rulesForPaths(rules, paths) {
+	const out = [];
+	for (const rule of rules) {
+		if (rule.globs.length === 0) {
+			out.push({
+				rule,
+				matched: null
+			});
+			continue;
+		}
+		const matched = ruleMatch(rule, paths);
+		if (matched) out.push({
+			rule,
+			matched
+		});
+	}
+	return out;
+}
+function ruleBlock(rule, matched) {
+	const scope = matched ? `for ${rule.globs.join(", ")}; ${matched} matches` : "for every change";
+	return `### ${rule.path} (${scope})\n${rule.text}`;
+}
+/**
+* Hands rules to the agent once each, within the budget: the rules the turn
+* starts with, then any a file it reads or edits later brings in.
+*/
+var RuleLoader = class {
+	rules;
+	loaded = [];
+	used = 0;
+	constructor(files) {
+		this.rules = scopedRules(files);
+	}
+	take(found) {
+		const blocks = [];
+		for (const { rule, matched } of found) {
+			if (this.loaded.includes(rule.path)) continue;
+			const block = ruleBlock(rule, matched);
+			if (this.used + block.length > RULE_LIMIT.total) continue;
+			this.used += block.length;
+			this.loaded.push(rule.path);
+			blocks.push(block);
+		}
+		return blocks;
+	}
+	/** For the system prompt: rules for every turn, and those for the files the turn starts on. */
+	initial(paths) {
+		const blocks = this.take(rulesForPaths(this.rules, paths));
+		return blocks.length === 0 ? "" : `Project rules for the files in this task. Follow them:\n\n${blocks.join("\n\n")}`;
+	}
+	/** Appended to a tool result when the agent reaches a file a rule not yet loaded is for. */
+	forPath(path, after) {
+		const blocks = this.take(rulesForPaths(this.rules.filter((rule) => rule.globs.length > 0), [path]));
+		if (blocks.length === 0) return "";
+		return `\n\n${after === "edit" ? `A project rule applies to ${path}. Check the edit you just staged follows it; if not, fix it with propose_edit.` : `A project rule applies to ${path}. Follow it in any edit to this file.`}\n\n${blocks.join("\n\n")}`;
+	}
+};
 // src/lib/workspace/safety.ts
 /** Known key formats, by who issues them. Each is specific enough that a match is almost never anything else. */
 const KEYS = [
@@ -155506,6 +156382,38 @@ function packageChanges(path, before, after) {
 		deps
 	};
 }
+const PROJECT_CHECKS = ".aperture/checks.json";
+/** The project's own checks (project-checks.ts), by name, as written. */
+function projectChecks(text) {
+	const data = json(text);
+	const entries = Array.isArray(data?.checks) ? data.checks : [];
+	const out = /* @__PURE__ */ new Map();
+	entries.forEach((entry, i) => {
+		const item = record(entry);
+		const name = typeof item.name === "string" && item.name.trim() ? item.name.trim() : `check ${i + 1}`;
+		out.set(name, JSON.stringify(item));
+	});
+	return out;
+}
+/** A check the change takes out or rewrites. Adding one is what the file is for; it proves itself on its own row. */
+function projectChecksEdited(before, after) {
+	const was = projectChecks(before);
+	const now = projectChecks(after);
+	const removed = [...was.keys()].filter((name) => !now.has(name));
+	const changed = [...was.keys()].filter((name) => now.has(name) && now.get(name) !== was.get(name));
+	const out = [];
+	if (removed.length > 0) out.push({
+		level: "look",
+		path: PROJECT_CHECKS,
+		what: `removes the project ${removed.length === 1 ? "check" : "checks"} ${names(removed.map((n) => `"${n}"`))}`
+	});
+	if (changed.length > 0) out.push({
+		level: "look",
+		path: PROJECT_CHECKS,
+		what: `changes the project ${changed.length === 1 ? "check" : "checks"} ${names(changed.map((n) => `"${n}"`))}`
+	});
+	return out;
+}
 /** Everything worth saying about a change, red first, in the order of the files. */
 function safetyFindings(files, edits) {
 	const out = [];
@@ -155525,6 +156433,7 @@ function safetyFindings(files, edits) {
 			out.push(...pkg.findings);
 			depsMoved ||= pkg.deps;
 		}
+		if (edit.path === PROJECT_CHECKS) out.push(...projectChecksEdited(before, after));
 		if (LOCKFILE.test(edit.path)) lockfiles.push(edit.path);
 		if (CI_FILE.test(edit.path)) ci.push(edit.path);
 	}
@@ -155540,6 +156449,230 @@ function safetyFindings(files, edits) {
 		what: `moves with no dependency change in package.json${alsoIn(lockfiles)}`
 	});
 	return [...out.filter((f) => f.level === "red"), ...out.filter((f) => f.level === "look")];
+}
+// src/lib/workspace/project-checks.ts
+/**
+* Project checks: the project's own rules about its code, in
+* `.aperture/checks.json`, each one a mistake that is not to happen again.
+*
+*   {
+*     "checks": [
+*       {
+*         "name": "no await inside a describe",
+*         "files": ["**\/*.test.ts"],
+*         "forbid": "^\\s*await (?:test|it)\\(",
+*         "example": "    await test(\"getIsCI can be disabled\", async () => {",
+*         "why": "describe callbacks are not async: declare the test without await."
+*       }
+*     ]
+*   }
+*
+* The teams shipping the most agent code say the same thing: turn each
+* mistake an agent makes into a check that cannot be argued with, not one
+* more line in a prompt. A project check is that, small enough for anyone to
+* write: a pattern for one line, read against each line a change adds to a
+* matching file. Lines the project already has are never blamed, so a check
+* can be added for a mistake the code still holds.
+*
+* A check proves itself. It carries an `example`, the line it was made to
+* catch; a new or changed check that does not catch its example is red, and
+* one that already matches lines in the project says how many, so a pattern
+* too broad to mean anything is seen before it is kept.
+*
+* Nothing runs: the same checks hold in the editor, in Aperture Agent Check
+* and Aperture Bot, and in `check_change`. Pure: tests import it directly.
+*/
+const CHECKS_PATH = ".aperture/checks.json";
+/** What one finding line and the row's evidence may hold, so a runaway pattern cannot flood either. */
+const MAX_FINDINGS = 40;
+const MAX_PATTERN = 500;
+/** Lines longer than this are minified or generated: not read. */
+const MAX_LINE = 2e3;
+function list(value) {
+	if (typeof value === "string") return value.split(",").map((s) => s.trim()).filter(Boolean);
+	if (Array.isArray(value)) return value.filter((v) => typeof v === "string").map((v) => v.trim()).filter(Boolean);
+	return [];
+}
+/** The checks in the file, and the first thing wrong with it. A broken entry is left out and named, not guessed at. */
+function parseChecks$1(raw) {
+	if (raw === void 0 || !raw.trim()) return {
+		checks: [],
+		error: null
+	};
+	let data;
+	try {
+		data = JSON.parse(raw);
+	} catch {
+		return {
+			checks: [],
+			error: `${CHECKS_PATH} is not valid JSON.`
+		};
+	}
+	const entries = Array.isArray(data) ? data : data?.checks;
+	if (!Array.isArray(entries)) return {
+		checks: [],
+		error: `${CHECKS_PATH} needs a "checks" list.`
+	};
+	const checks = [];
+	let error = null;
+	entries.forEach((entry, index) => {
+		const item = entry ?? {};
+		const name = typeof item.name === "string" && item.name.trim() ? item.name.trim().slice(0, 80) : `check ${index + 1}`;
+		const pattern = typeof item.forbid === "string" ? item.forbid : "";
+		if (!pattern || pattern.length > MAX_PATTERN) {
+			error ??= `Check "${name}": "forbid" must be a pattern of at most ${MAX_PATTERN} characters.`;
+			return;
+		}
+		const flags = typeof item.flags === "string" ? item.flags : "";
+		if (!/^[imsu]*$/.test(flags)) {
+			error ??= `Check "${name}": "flags" may only use i, m, s and u.`;
+			return;
+		}
+		let forbid;
+		try {
+			forbid = new RegExp(pattern, flags);
+		} catch (e) {
+			error ??= `Check "${name}": "forbid" is not a valid pattern (${e instanceof Error ? e.message : String(e)}).`;
+			return;
+		}
+		const why = typeof item.why === "string" ? item.why.trim().slice(0, 300) : "";
+		if (!why) {
+			error ??= `Check "${name}": "why" must say what to do instead.`;
+			return;
+		}
+		if (checks.length >= 50) {
+			error ??= `Only the first 50 checks run.`;
+			return;
+		}
+		checks.push({
+			name,
+			files: list(item.files),
+			forbid,
+			...typeof item.example === "string" ? { example: item.example } : {},
+			why,
+			level: item.level === "look" ? "look" : "red",
+			raw: JSON.stringify(item)
+		});
+	});
+	return {
+		checks,
+		error
+	};
+}
+function applies(check, path) {
+	if (path === ".aperture/checks.json") return false;
+	return check.files.length === 0 || check.files.some((glob) => globMatches(glob, path));
+}
+/** Each line a change adds that a check forbids, in the order of the files. */
+function checkFindings(checks, files, edits) {
+	const out = [];
+	for (const edit of edits) {
+		if (edit.deleted) continue;
+		const mine = checks.filter((check) => applies(check, edit.path));
+		if (mine.length === 0) continue;
+		const before = files[edit.path] ?? "";
+		if (before === edit.newText) continue;
+		for (const { text, line } of addedLines$1(before, edit.newText)) {
+			if (text.length > MAX_LINE) continue;
+			for (const check of mine) {
+				if (!check.forbid.test(text)) continue;
+				out.push({
+					level: check.level,
+					path: edit.path,
+					line,
+					check: check.name,
+					why: check.why
+				});
+				if (out.length >= MAX_FINDINGS) return out;
+			}
+		}
+	}
+	return out;
+}
+/**
+* What is wrong with the checks a change adds or changes: the file itself,
+* a check that does not catch its own example (red), one with no example to
+* prove it (worth a look), and one that already matches lines in the project
+* (worth a look: they stay, and only new ones are held, but a pattern that
+* matches a great deal may be broader than the mistake).
+*/
+function newCheckProblems(before, after, project) {
+	const now = parseChecks$1(after);
+	const out = [];
+	if (now.error) out.push({
+		level: "red",
+		text: `${CHECKS_PATH}: ${now.error}`
+	});
+	const had = new Set(parseChecks$1(before).checks.map((check) => check.raw));
+	for (const check of now.checks) {
+		if (had.has(check.raw)) continue;
+		if (check.example === void 0) out.push({
+			level: "look",
+			text: `The check "${check.name}" has no "example": the line it was made to catch, which proves it catches it.`
+		});
+		else if (!check.forbid.test(check.example)) out.push({
+			level: "red",
+			text: `The check "${check.name}" does not catch its own example: its "forbid" pattern does not match ${JSON.stringify(check.example.slice(0, 120))}.`
+		});
+		let matches = 0;
+		let first = null;
+		for (const [path, text] of Object.entries(project)) {
+			if (!applies(check, path)) continue;
+			text.split("\n").forEach((line, i) => {
+				if (line.length > MAX_LINE || !check.forbid.test(line)) return;
+				matches += 1;
+				first ??= `${path} at line ${i + 1}`;
+			});
+		}
+		if (matches > 0) out.push({
+			level: "look",
+			text: `The check "${check.name}" already matches ${matches} ${matches === 1 ? "line" : "lines"} in the project (first: ${first}). Those stay; only new ones are held. If that is more than the mistake, narrow the pattern.`
+		});
+	}
+	return out;
+}
+/** The project's own checks on a change, as one row; null when the project has none and the change adds none. */
+function projectChecksRow(files, edits) {
+	const config = parseChecks$1(files[CHECKS_PATH]);
+	const staged = edits.find((edit) => edit.path === ".aperture/checks.json" && !edit.deleted);
+	if (config.checks.length === 0 && !config.error && !staged) return null;
+	const label = "Project checks";
+	const findings = checkFindings(config.checks, files, edits);
+	const project = { ...files };
+	for (const edit of edits) if (edit.deleted) delete project[edit.path];
+	else project[edit.path] = edit.newText;
+	const proof = staged ? newCheckProblems(files[CHECKS_PATH], staged.newText, project) : [];
+	const line = (f) => `${f.path}: breaks the project check "${f.check}" at line ${f.line}: ${f.why}`;
+	const red = [...findings.filter((f) => f.level === "red").map(line), ...proof.filter((p) => p.level === "red").map((p) => p.text)];
+	const look = [...findings.filter((f) => f.level === "look").map(line), ...proof.filter((p) => p.level === "look").map((p) => p.text)];
+	const firstPath = findings[0]?.path ?? (staged && proof.length > 0 ? ".aperture/checks.json" : void 0);
+	const more = (n) => n > 0 ? ` (+${n} more)` : "";
+	if (red.length > 0) return {
+		id: "project",
+		label,
+		status: "fail",
+		detail: `${red[0]}${more(red.length + look.length - 1)}`,
+		...firstPath ? { path: firstPath } : {},
+		evidence: [
+			...red,
+			...look,
+			"These are the project's own checks (.aperture/checks.json). Change the code so it no longer does what they forbid; do not change or remove a check to get past it."
+		].join("\n")
+	};
+	if (look.length > 0) return {
+		id: "project",
+		label,
+		status: "warn",
+		detail: `Worth a look: ${look[0]}${more(look.length - 1)}`,
+		...firstPath ? { path: firstPath } : {}
+	};
+	const n = parseChecks$1(staged ? staged.newText : files[CHECKS_PATH]).checks.length;
+	return {
+		id: "project",
+		label,
+		status: "pass",
+		detail: `Nothing this change adds breaks the project's ${n === 1 ? "check" : `${n} checks`}.`
+	};
 }
 // src/lib/workspace/checks.ts
 function firstIssue(rows) {
@@ -155706,62 +156839,68 @@ function changeChecks(input) {
 		status: "pass",
 		detail: `Nothing this light check can prove in ${plural(typed.length, "file")}. Not tsc.`
 	};
+	const types = !checkable.some(isTypePath) ? {
+		id: "types",
+		label: "Types",
+		status: "skip",
+		detail: "No TypeScript in this change."
+	} : typed.length === 0 ? {
+		id: "types",
+		label: "Types",
+		status: "skip",
+		detail: "Checked once the TypeScript parses."
+	} : tsc?.state === "running" ? {
+		id: "types",
+		label: "Types",
+		status: "running",
+		detail: "Type-checking with tsc…"
+	} : tsc?.state === "done" ? tscRow(tsc, typed, snapshot) : tsc?.state === "unavailable" ? {
+		...light,
+		detail: `${light.detail} (tsc did not run: ${tsc.reason})`
+	} : light;
+	const preview = render === null ? {
+		id: "preview",
+		label: "Preview renders",
+		status: "skip",
+		detail: "This change does not touch a page."
+	} : render.state === "pending" ? {
+		id: "preview",
+		label: "Preview renders",
+		status: "running",
+		detail: "Rendering the staged page…"
+	} : render.state === "timeout" ? {
+		id: "preview",
+		label: "Preview renders",
+		status: "fail",
+		detail: "The staged page did not finish loading."
+	} : render.errors.length > 0 ? {
+		id: "preview",
+		label: "Preview renders",
+		status: "fail",
+		detail: `${render.errors[0]}${render.errors.length > 1 ? ` (+${render.errors.length - 1} more)` : ""}`,
+		evidence: render.evidence || render.errors.join("\n")
+	} : render.blank ? {
+		id: "preview",
+		label: "Preview renders",
+		status: "fail",
+		detail: "The staged page renders blank."
+	} : {
+		id: "preview",
+		label: "Preview renders",
+		status: "pass",
+		detail: "The staged page renders with no errors."
+	};
+	const tests = tamperedRow(testsRow(verify ?? null, input.browser ?? null), testChanges(files, edits));
+	const safety = safetyRow(safetyFindings(files, edits));
+	const project = projectChecksRow(files, edits);
 	return [
 		parsesRow,
 		imports,
-		!checkable.some(isTypePath) ? {
-			id: "types",
-			label: "Types",
-			status: "skip",
-			detail: "No TypeScript in this change."
-		} : typed.length === 0 ? {
-			id: "types",
-			label: "Types",
-			status: "skip",
-			detail: "Checked once the TypeScript parses."
-		} : tsc?.state === "running" ? {
-			id: "types",
-			label: "Types",
-			status: "running",
-			detail: "Type-checking with tsc…"
-		} : tsc?.state === "done" ? tscRow(tsc, typed, snapshot) : tsc?.state === "unavailable" ? {
-			...light,
-			detail: `${light.detail} (tsc did not run: ${tsc.reason})`
-		} : light,
-		render === null ? {
-			id: "preview",
-			label: "Preview renders",
-			status: "skip",
-			detail: "This change does not touch a page."
-		} : render.state === "pending" ? {
-			id: "preview",
-			label: "Preview renders",
-			status: "running",
-			detail: "Rendering the staged page…"
-		} : render.state === "timeout" ? {
-			id: "preview",
-			label: "Preview renders",
-			status: "fail",
-			detail: "The staged page did not finish loading."
-		} : render.errors.length > 0 ? {
-			id: "preview",
-			label: "Preview renders",
-			status: "fail",
-			detail: `${render.errors[0]}${render.errors.length > 1 ? ` (+${render.errors.length - 1} more)` : ""}`,
-			evidence: render.evidence || render.errors.join("\n")
-		} : render.blank ? {
-			id: "preview",
-			label: "Preview renders",
-			status: "fail",
-			detail: "The staged page renders blank."
-		} : {
-			id: "preview",
-			label: "Preview renders",
-			status: "pass",
-			detail: "The staged page renders with no errors."
-		},
-		tamperedRow(testsRow(verify ?? null, input.browser ?? null), testChanges(files, edits)),
-		safetyRow(safetyFindings(files, edits)),
+		types,
+		preview,
+		tests,
+		safety,
+		...project ? [project] : [],
 		...(input.hooks ?? []).map(hookRow),
 		...skillRows(verify ?? null)
 	];
@@ -156097,7 +157236,7 @@ function climbsOut(from, spec) {
 	}
 	return false;
 }
-const DEFAULTS$1 = {
+const DEFAULTS = {
 	target: "ES2022",
 	module: "ESNext",
 	moduleResolution: "Bundler",
@@ -156113,11 +157252,11 @@ function isTsPath(path) {
 const isInstalledPath = (name) => name === "/node_modules" || name.startsWith("/node_modules/");
 function compilerOptions(ts, files, opts = {}) {
 	const raw = files["tsconfig.json"];
-	let json = DEFAULTS$1;
+	let json = DEFAULTS;
 	if (raw !== void 0) {
 		const options = ts.parseConfigFileTextToJson("/tsconfig.json", raw).config?.compilerOptions;
 		if (options && typeof options === "object") json = {
-			...DEFAULTS$1,
+			...DEFAULTS,
 			...options
 		};
 	}
@@ -156391,7 +157530,8 @@ function staticChangeChecks(input) {
 		...emptied,
 		...others
 	]));
-	return checked.map((row) => row.id === "safety" ? safety : row);
+	const project = projectChecksRow(files, [...edits, ...others]);
+	return checked.map((row) => row.id === "safety" ? safety : row.id === "project" && project ? project : row);
 }
 // packages/agent-check/src/baseline.ts
 /**
@@ -157601,7 +158741,7 @@ const BARE = /(?!(?:true|false|null|none|undefined)\b|\[redacted)(?![$%]|process
 /** A quoted value that reads as a sentence (a label, a message) or as an environment variable's name. */
 const NOT_A_SECRET = /^(?:[^ ]* ){5,}|^[A-Z][A-Z0-9_]*$/;
 /** Files where a bare value after `password =` is an expression, not the password. */
-const CODE_EXT$1 = /* @__PURE__ */ new Set([
+const CODE_EXT = /* @__PURE__ */ new Set([
 	"ts",
 	"tsx",
 	"js",
@@ -157628,7 +158768,7 @@ const CODE_EXT$1 = /* @__PURE__ */ new Set([
 function isCodePath(path) {
 	const base = path?.split("/").pop() ?? "";
 	const dot = base.lastIndexOf(".");
-	return dot > 0 && CODE_EXT$1.has(base.slice(dot + 1).toLowerCase());
+	return dot > 0 && CODE_EXT.has(base.slice(dot + 1).toLowerCase());
 }
 /** Replaces the value after each secret name: a quoted literal always, a bare one only outside code. */
 function redactValues(text, code) {
@@ -158091,7 +159231,7 @@ function isSkillPath(path) {
 function skillName(raw) {
 	return raw.toLowerCase().replace(/\.md$/i, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
-const unquote$1 = (value) => value.trim().replace(/^(["'])(.*)\1$/, "$2").trim();
+const unquote = (value) => value.trim().replace(/^(["'])(.*)\1$/, "$2").trim();
 /** Front matter (name, description), then the steps. A file with no steps is not a skill. */
 function parseSkill(path, raw) {
 	const text = raw.replace(/\r\n/g, "\n");
@@ -158104,8 +159244,8 @@ function parseSkill(path, raw) {
 	for (const line of front?.[1]?.split("\n") ?? []) {
 		const match = /^([A-Za-z]+)\s*:\s*(.*)$/.exec(line);
 		if (!match) continue;
-		if (match[1].toLowerCase() === "name") name = unquote$1(match[2]);
-		if (match[1].toLowerCase() === "description") description = unquote$1(match[2]);
+		if (match[1].toLowerCase() === "name") name = unquote(match[2]);
+		if (match[1].toLowerCase() === "description") description = unquote(match[2]);
 		if (match[1].toLowerCase() === "checks") checks = parseChecks(match[2]);
 	}
 	const rest = path.slice(17);
@@ -159805,882 +160945,6 @@ function findRules(files) {
 	}
 	return null;
 }
-// src/lib/runner/config.ts
-const CONFIG_EXT = [
-	"ts",
-	"mts",
-	"cts",
-	"js",
-	"mjs",
-	"cjs"
-];
-/** Vitest keys the runner honours or that change nothing about a single run. */
-const VITEST_KEYS = /* @__PURE__ */ new Set([
-	"test",
-	"globals",
-	"environment",
-	"include",
-	"exclude",
-	"testTimeout",
-	"hookTimeout",
-	"passWithNoTests",
-	"reporters",
-	"reporter",
-	"watch",
-	"clearMocks",
-	"mockReset",
-	"restoreMocks",
-	"isolate",
-	"pool",
-	"fileParallelism",
-	"silent",
-	"css",
-	"unstubGlobals",
-	"unstubEnvs",
-	"coverage",
-	"provider",
-	"reportsDirectory",
-	"all",
-	"enabled",
-	"clean"
-]);
-/** Vite keys a Vitest run ignores (dev server, production build). */
-const VITE_ONLY_KEYS = /* @__PURE__ */ new Set([
-	"server",
-	"preview",
-	"build",
-	"base",
-	"publicDir",
-	"clearScreen",
-	"logLevel",
-	"port",
-	"host",
-	"open",
-	"outDir",
-	"sourcemap"
-]);
-const JEST_KEYS = /* @__PURE__ */ new Set([
-	"testEnvironment",
-	"testMatch",
-	"testRegex",
-	"testPathIgnorePatterns",
-	"moduleFileExtensions",
-	"clearMocks",
-	"resetMocks",
-	"restoreMocks",
-	"verbose",
-	"testTimeout",
-	"bail",
-	"preset",
-	"transform",
-	"collectCoverageFrom",
-	"coverageDirectory",
-	"coverageReporters",
-	"coverageThreshold",
-	"coverageProvider",
-	"coveragePathIgnorePatterns",
-	"watchPathIgnorePatterns",
-	"maxWorkers",
-	"passWithNoTests",
-	"displayName",
-	"notify",
-	"errorOnDeprecated",
-	"injectGlobals",
-	"silent",
-	"roots",
-	"global",
-	"branches",
-	"functions",
-	"lines",
-	"statements",
-	"tsconfig",
-	"isolatedModules",
-	"diagnostics",
-	"useESM"
-]);
-/** Transformers that only strip types or compile JSX, which the runner does itself. */
-const PLAIN_TRANSFORMERS = /^(ts-jest|babel-jest|@swc\/jest|esbuild-jest|@sucrase\/jest-plugin|sucrase-jest)$/;
-/**
-* What a config may import: the config helpers, and plugins that only compile
-* JSX or CSS. The runner compiles JSX itself, and a test that loads CSS is
-* unsupported anyway.
-*/
-const CONFIG_IMPORTS = /^(vitest\/config|vitest|vite|@jest\/types|jest|ts-jest|@vitejs\/plugin-react(-swc)?|@tailwindcss\/vite)$/;
-function stripComments(source) {
-	let out = "";
-	let quote = null;
-	for (let i = 0; i < source.length; i++) {
-		const c = source[i];
-		if (quote) {
-			out += c;
-			if (c === "\\") out += source[++i] ?? "";
-			else if (c === quote) quote = null;
-		} else if (c === "\"" || c === "'" || c === "`") {
-			quote = c;
-			out += c;
-		} else if (c === "/" && source[i + 1] === "/") {
-			while (i < source.length && source[i] !== "\n") i++;
-			out += "\n";
-		} else if (c === "/" && source[i + 1] === "*") {
-			const end = source.indexOf("*/", i + 2);
-			i = end < 0 ? source.length : end + 1;
-		} else out += c;
-	}
-	return out;
-}
-/** Drops `key: { … }` so its nested keys (coverage's own `include`) are not read as the test settings. */
-function withoutBlock(source, key) {
-	const m = new RegExp(`\\b${key}\\s*:\\s*\\{`).exec(source);
-	if (!m) return source;
-	let depth = 0;
-	for (let i = m.index + m[0].length - 1; i < source.length; i++) if (source[i] === "{") depth++;
-	else if (source[i] === "}" && --depth === 0) return source.slice(0, m.index) + source.slice(i + 1);
-	return source;
-}
-function stringList(source, key) {
-	const m = source.match(new RegExp(`\\b${key}\\s*:\\s*\\[([^\\]]*)\\]`));
-	if (!m) {
-		const single = source.match(new RegExp(`\\b${key}\\s*:\\s*(["'\`])([^"'\`]*)\\1`));
-		return single ? [single[2]] : null;
-	}
-	return [...m[1].matchAll(/(["'`])((?:\\.|(?!\1).)*)\1/g)].map((s) => s[2].replace(/\\\\/g, "\\"));
-}
-function stringValue(source, key) {
-	const m = source.match(new RegExp(`\\b${key}\\s*:\\s*(["'\`])([^"'\`]*)\\1`));
-	return m ? m[2] : null;
-}
-function isTrue(source, key) {
-	return new RegExp(`\\b${key}\\s*:\\s*true\\b`).test(source);
-}
-function numberValue(source, key) {
-	const m = source.match(new RegExp(`\\b${key}\\s*:\\s*([\\d_]+)`));
-	return m ? Number(m[1].replace(/_/g, "")) : null;
-}
-/** Object keys a JS config sets, quoted or bare. Imprecise on purpose: an unknown word refuses, never accepts. */
-function keysOf(source) {
-	const keys = [];
-	for (const m of source.matchAll(/(?:(["'])([A-Za-z_$][\w$-]*)\1|(?<![\w$.?"'])([A-Za-z_$][\w$]*))\s*:(?!:)/g)) keys.push(m[2] ?? m[3]);
-	return keys;
-}
-function importsOf(source) {
-	const specs = [];
-	for (const m of source.matchAll(/\bfrom\s*(["'])([^"']+)\1|\bimport\s*(["'])([^"']+)\3|\brequire\(\s*(["'])([^"']+)\5\s*\)/g)) specs.push(m[2] ?? m[4] ?? m[6]);
-	return specs;
-}
-function findFile(files, stems) {
-	for (const stem of stems) for (const ext of CONFIG_EXT) if (files[`${stem}.${ext}`] !== void 0) return `${stem}.${ext}`;
-	return null;
-}
-/**
-* Glob to RegExp, with the extglob and class syntax Vitest and Jest defaults use:
-* `**`, `*`, `?`, `{a,b}`, `[jt]`, `?(x)`, `+(a|b)`, `*(x)`, `@(x)`.
-*/
-function testGlobToRegExp(glob) {
-	let out = "";
-	const src = glob.replace(/^<rootDir>\//, "").replace(/^\.\//, "");
-	for (let i = 0; i < src.length; i++) {
-		const c = src[i];
-		const next = src[i + 1];
-		if ((c === "?" || c === "+" || c === "*" || c === "@") && next === "(") {
-			const end = src.indexOf(")", i);
-			if (end > i) {
-				const body = src.slice(i + 2, end).split("|").map((part) => testGlobToRegExp(part).source.slice(1, -1)).join("|");
-				out += `(?:${body})${c === "@" ? "" : c}`;
-				i = end;
-				continue;
-			}
-		}
-		if (c === "*" && next === "*") {
-			if (src[i + 2] === "/") {
-				out += "(?:.*/)?";
-				i += 2;
-			} else {
-				out += ".*";
-				i += 1;
-			}
-		} else if (c === "*") out += "[^/]*";
-		else if (c === "?") out += "[^/]";
-		else if (c === "[") {
-			const end = src.indexOf("]", i);
-			if (end < 0) out += "\\[";
-			else {
-				out += `[${src.slice(i + 1, end).replace(/^!/, "^").replace(/\\/g, "\\\\")}]`;
-				i = end;
-			}
-		} else if (c === "{") {
-			const end = src.indexOf("}", i);
-			if (end < 0) {
-				out += "\\{";
-				continue;
-			}
-			out += `(?:${src.slice(i + 1, end).split(",").map((part) => testGlobToRegExp(part).source.slice(1, -1)).join("|")})`;
-			i = end;
-		} else out += c.replace(/[.+^$()|\]\\]/g, "\\$&");
-	}
-	return new RegExp(`^${out}$`);
-}
-const DEFAULTS = {
-	source: null,
-	globals: false,
-	include: null,
-	exclude: [],
-	testTimeout: null,
-	clearMocks: false,
-	resetMocks: false,
-	restoreMocks: false
-};
-function refuse(file, what) {
-	return {
-		ok: false,
-		reason: `${file} ${what}, which the browser runner does not support.`
-	};
-}
-function checkImports(file, source) {
-	const other = importsOf(source).find((spec) => !CONFIG_IMPORTS.test(spec));
-	return other ? refuse(file, `imports ${other}`) : null;
-}
-function readVitestConfig(files) {
-	if (findFile(files, ["vitest.workspace", "vitest.projects"])) return {
-		ok: false,
-		reason: "A Vitest workspace runs several projects, which the browser runner does not support."
-	};
-	const file = findFile(files, ["vitest.config", "vite.config"]);
-	if (!file) return {
-		ok: true,
-		...DEFAULTS
-	};
-	const source = stripComments(files[file]);
-	const bad = checkImports(file, source);
-	if (bad) return bad;
-	const isVite = file.startsWith("vite.");
-	for (const key of keysOf(source)) {
-		if (VITEST_KEYS.has(key)) continue;
-		if (key === "plugins" || isVite && VITE_ONLY_KEYS.has(key)) continue;
-		return refuse(file, `sets ${key}`);
-	}
-	const settings = withoutBlock(source, "coverage");
-	const environment = stringValue(settings, "environment");
-	if (environment && environment !== "node") return refuse(file, `runs tests in a ${environment} environment`);
-	const include = stringList(settings, "include");
-	const exclude = stringList(settings, "exclude");
-	return {
-		ok: true,
-		source: file,
-		globals: isTrue(settings, "globals"),
-		include: include ? include.map(testGlobToRegExp) : null,
-		exclude: (exclude ?? []).map(testGlobToRegExp),
-		testTimeout: numberValue(settings, "testTimeout"),
-		clearMocks: isTrue(settings, "clearMocks"),
-		resetMocks: isTrue(settings, "mockReset"),
-		restoreMocks: isTrue(settings, "restoreMocks")
-	};
-}
-function jestFromObject(file, config) {
-	for (const key of Object.keys(config)) if (!JEST_KEYS.has(key)) return refuse(file, `sets ${key}`);
-	const env = config.testEnvironment;
-	if (env !== void 0 && env !== "node") return refuse(file, `runs tests in a ${String(env)} environment`);
-	if (config.preset !== void 0 && !/^ts-jest(\/.*)?$/.test(String(config.preset))) return refuse(file, `uses the ${String(config.preset)} preset`);
-	if (config.transform !== void 0) {
-		const other = Object.values(config.transform ?? {}).map((v) => Array.isArray(v) ? v[0] : v).find((v) => !PLAIN_TRANSFORMERS.test(String(v)));
-		if (other !== void 0) return refuse(file, `transforms files with ${String(other)}`);
-	}
-	if (config.roots !== void 0) {
-		if ((Array.isArray(config.roots) ? config.roots : []).map(String).some((r) => r !== "<rootDir>" && !r.startsWith("<rootDir>/"))) return refuse(file, "sets roots outside the project");
-	}
-	const list = (v) => Array.isArray(v) ? v.map(String) : typeof v === "string" ? [v] : null;
-	const match = list(config.testMatch);
-	const regex = list(config.testRegex);
-	let include = null;
-	try {
-		if (match) include = match.map(testGlobToRegExp);
-		else if (regex) include = regex.map((r) => new RegExp(r));
-	} catch {
-		return refuse(file, "sets a testRegex that is not a valid regular expression");
-	}
-	const ignore = list(config.testPathIgnorePatterns) ?? [];
-	const exclude = [];
-	for (const pattern of ignore) try {
-		exclude.push(new RegExp(pattern.replace(/<rootDir>\/?/g, "")));
-	} catch {
-		return refuse(file, "sets a testPathIgnorePatterns entry that is not a valid regular expression");
-	}
-	return {
-		ok: true,
-		source: file,
-		globals: config.injectGlobals !== false,
-		include,
-		exclude,
-		testTimeout: typeof config.testTimeout === "number" ? config.testTimeout : null,
-		clearMocks: config.clearMocks === true,
-		resetMocks: config.resetMocks === true,
-		restoreMocks: config.restoreMocks === true
-	};
-}
-/** A JS Jest config read as far as a regex can: keys, plus the few values the runner uses. */
-function jestFromSource(file, raw) {
-	const source = stripComments(raw);
-	const bad = checkImports(file, source);
-	if (bad) return bad;
-	const config = {};
-	for (const key of keysOf(source)) config[key] = true;
-	const transform = source.match(/\btransform\s*:\s*\{([^}]*)\}/);
-	if (transform) config.transform = Object.fromEntries([...transform[1].matchAll(/(["'])(?:\\.|(?!\1).)*\1\s*:\s*\[?\s*(["'])([^"']+)\2/g)].map((m, i) => [String(i), m[3]]));
-	for (const key of ["testEnvironment", "preset"]) if (key in config) config[key] = stringValue(source, key) ?? "(computed)";
-	for (const key of [
-		"testMatch",
-		"testRegex",
-		"testPathIgnorePatterns",
-		"roots"
-	]) if (key in config) config[key] = stringList(source, key) ?? ["(computed)"];
-	if ("testTimeout" in config) config.testTimeout = numberValue(source, "testTimeout") ?? void 0;
-	for (const key of [
-		"clearMocks",
-		"resetMocks",
-		"restoreMocks",
-		"injectGlobals"
-	]) if (key in config) config[key] = new RegExp(`\\b${key}\\s*:\\s*false\\b`).test(source) ? false : isTrue(source, key);
-	for (const key of ["exports", "default"]) delete config[key];
-	return jestFromObject(file, config);
-}
-function readJestConfig(files) {
-	const file = findFile(files, ["jest.config"]);
-	if (file) return jestFromSource(file, files[file]);
-	if (files["jest.config.json"] !== void 0) try {
-		return jestFromObject("jest.config.json", JSON.parse(files["jest.config.json"]));
-	} catch {
-		return {
-			ok: false,
-			reason: "jest.config.json is not valid JSON."
-		};
-	}
-	try {
-		const pkg = JSON.parse(files["package.json"] ?? "{}");
-		if (pkg.jest && typeof pkg.jest === "object") return jestFromObject("package.json's jest field", pkg.jest);
-	} catch {}
-	return {
-		ok: true,
-		...DEFAULTS,
-		globals: true
-	};
-}
-function readTestConfig(files, framework) {
-	return framework === "vitest" ? readVitestConfig(files) : readJestConfig(files);
-}
-// src/lib/runner/plan.ts
-/**
-* Which files `npm run <script>` would run, when the browser can run them.
-*
-* Only the shapes a browser can honour: `node [flags] files…`, `node --test
-* [files or globs]` and `tsx files…`, chained with `&&`; and `vitest` or
-* `jest` with a config that asks for nothing beyond picking files (see
-* `config.ts`). Anything else (a build step, a DOM environment, plugins)
-* needs a real Node, and the answer says so rather than guessing.
-*/
-const NODE_OPTIONS = {
-	globals: false,
-	namePattern: null,
-	testTimeout: null,
-	clearMocks: false,
-	resetMocks: false,
-	restoreMocks: false
-};
-/** Flags that change nothing about what runs, or that this runner provides anyway. */
-const HARMLESS_FLAGS = /^--(experimental-strip-types|experimental-transform-types|no-warnings|enable-source-maps|test|test-reporter(=.*)?|test-concurrency(=.*)?|test-timeout(=.*)?|no-experimental-fetch|trace-warnings|disable-warning(=.*)?)$/;
-const CODE_EXT = "(c|m)?(j|t)s";
-/** `node --test` with no files: Node's own default patterns. */
-const DEFAULT_TEST_FILES = new RegExp(`(^|/)(test|[^/]*[._-]test|test-[^/]*)\\.${CODE_EXT}$|(^|/)test/.+\\.${CODE_EXT}$`);
-function globToRegExp(glob) {
-	let out = "";
-	for (let i = 0; i < glob.length; i++) {
-		const c = glob[i];
-		if (c === "*" && glob[i + 1] === "*") {
-			if (glob[i + 2] === "/") {
-				out += "(?:.*/)?";
-				i += 2;
-			} else {
-				out += ".*";
-				i += 1;
-			}
-		} else if (c === "*") out += "[^/]*";
-		else if (c === "?") out += "[^/]";
-		else if (c === "{") {
-			const end = glob.indexOf("}", i);
-			if (end < 0) {
-				out += "\\{";
-				continue;
-			}
-			out += `(?:${glob.slice(i + 1, end).split(",").map((part) => part.replace(/[.+^$()|[\]\\]/g, "\\$&")).join("|")})`;
-			i = end;
-		} else out += c.replace(/[.+^$()|[\]\\]/g, "\\$&");
-	}
-	return new RegExp(`^${out}$`);
-}
-function words(command) {
-	return (command.match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map((w) => w.replace(/^(["'])(.*)\1$/, "$2"));
-}
-function cleanPath(path) {
-	return path.replace(/^\.\//, "").replace(/\/+$/, "");
-}
-function projectFiles(files) {
-	return Object.keys(files).filter((p) => !p.split("/").includes("node_modules")).sort();
-}
-const VITEST_DEFAULT = [testGlobToRegExp("**/*.{test,spec}.?(c|m)[jt]s?(x)")];
-const VITEST_EXCLUDE = /(^|\/)(dist|cypress|\.(idea|git|cache|output|temp))\/|(^|\/)(karma|rollup|webpack|vite|vitest|jest|ava|babel|nyc|cypress|tsup|build|eslint|prettier)\.config\./;
-const JEST_DEFAULT = [testGlobToRegExp("**/__tests__/**/*.[jt]s?(x)"), testGlobToRegExp("**/?(*.)+(spec|test).[jt]s?(x)")];
-const envNode = (value) => value === "node" ? null : `runs tests in a ${value} environment`;
-const VITEST_FLAGS = {
-	"--run": { takesValue: false },
-	"--watch": { takesValue: false },
-	"--no-watch": { takesValue: false },
-	"--globals": { takesValue: false },
-	"--passWithNoTests": { takesValue: false },
-	"--silent": { takesValue: false },
-	"--color": { takesValue: false },
-	"--no-color": { takesValue: false },
-	"--coverage": { takesValue: false },
-	"--no-coverage": { takesValue: false },
-	"--isolate": { takesValue: false },
-	"--no-isolate": { takesValue: false },
-	"--no-file-parallelism": { takesValue: false },
-	"--allowOnly": { takesValue: false },
-	"--clearMocks": { takesValue: false },
-	"--mockReset": { takesValue: false },
-	"--restoreMocks": { takesValue: false },
-	"--reporter": { takesValue: true },
-	"--outputFile": { takesValue: true },
-	"--pool": { takesValue: true },
-	"--bail": { takesValue: true },
-	"--maxWorkers": { takesValue: true },
-	"--minWorkers": { takesValue: true },
-	"--testTimeout": { takesValue: true },
-	"--hookTimeout": { takesValue: true },
-	"--environment": {
-		takesValue: true,
-		check: envNode
-	},
-	"--testNamePattern": { takesValue: true },
-	"-t": { takesValue: true },
-	"--config": "refuse",
-	"-c": "refuse",
-	"--root": "refuse",
-	"-r": "refuse",
-	"--dir": "refuse",
-	"--project": "refuse",
-	"--workspace": "refuse",
-	"--shard": "refuse",
-	"--typecheck": "refuse",
-	"--browser": "refuse",
-	"--dom": "refuse",
-	"--changed": "refuse",
-	"--update": "refuse",
-	"-u": "refuse"
-};
-const JEST_FLAGS = {
-	"--ci": { takesValue: false },
-	"--runInBand": { takesValue: false },
-	"-i": { takesValue: false },
-	"--verbose": { takesValue: false },
-	"--silent": { takesValue: false },
-	"--passWithNoTests": { takesValue: false },
-	"--colors": { takesValue: false },
-	"--no-colors": { takesValue: false },
-	"--no-cache": { takesValue: false },
-	"--detectOpenHandles": { takesValue: false },
-	"--forceExit": { takesValue: false },
-	"--watch": { takesValue: false },
-	"--watchAll": { takesValue: false },
-	"--no-watchman": { takesValue: false },
-	"--coverage": { takesValue: false },
-	"--clearMocks": { takesValue: false },
-	"--resetMocks": { takesValue: false },
-	"--restoreMocks": { takesValue: false },
-	"--errorOnDeprecated": { takesValue: false },
-	"--bail": { takesValue: false },
-	"--noStackTrace": { takesValue: false },
-	"--expand": { takesValue: false },
-	"--logHeapUsage": { takesValue: false },
-	"--useStderr": { takesValue: false },
-	"--testNamePattern": { takesValue: true },
-	"-t": { takesValue: true },
-	"--testTimeout": { takesValue: true },
-	"--maxWorkers": { takesValue: true },
-	"-w": { takesValue: true },
-	"--reporters": { takesValue: true },
-	"--coverageReporters": { takesValue: true },
-	"--env": {
-		takesValue: true,
-		check: envNode
-	},
-	"--testEnvironment": {
-		takesValue: true,
-		check: envNode
-	},
-	"--testPathPattern": { takesValue: true },
-	"--testPathPatterns": { takesValue: true },
-	"--testPathIgnorePatterns": { takesValue: true },
-	"--config": "refuse",
-	"-c": "refuse",
-	"--rootDir": "refuse",
-	"--roots": "refuse",
-	"--projects": "refuse",
-	"--selectProjects": "refuse",
-	"--shard": "refuse",
-	"--setupFiles": "refuse",
-	"--setupFilesAfterEnv": "refuse",
-	"--findRelatedTests": "refuse",
-	"--onlyChanged": "refuse",
-	"-o": "refuse",
-	"--changedSince": "refuse",
-	"--listTests": "refuse",
-	"--updateSnapshot": "refuse",
-	"-u": "refuse"
-};
-/** `node node_modules/.bin/jest …`, the usual way to run Jest with ES modules. */
-const FRAMEWORK_BIN = /^(?:\.\/)?node_modules\/(?:\.bin\/(jest|vitest)|(jest)\/bin\/jest\.js|(vitest)\/vitest\.mjs)$/;
-function hasDependency(files, name) {
-	try {
-		const pkg = JSON.parse(files["package.json"] ?? "{}");
-		return Boolean(pkg.devDependencies?.[name] ?? pkg.dependencies?.[name]);
-	} catch {
-		return false;
-	}
-}
-function parseFrameworkArgs(framework, args, script) {
-	const flags = framework === "vitest" ? VITEST_FLAGS : JEST_FLAGS;
-	const out = {
-		filters: [],
-		ignore: [],
-		namePattern: null,
-		globals: false
-	};
-	let rest = args;
-	if (framework === "vitest" && rest[0] && !rest[0].startsWith("-")) {
-		if ([
-			"run",
-			"watch",
-			"dev"
-		].includes(rest[0])) rest = rest.slice(1);
-		else if ([
-			"bench",
-			"typecheck",
-			"related",
-			"init",
-			"list"
-		].includes(rest[0])) return { reason: `\`npm run ${script}\` runs vitest ${rest[0]}, which the browser runner does not support.` };
-	}
-	for (let i = 0; i < rest.length; i++) {
-		const word = rest[i];
-		if (!word.startsWith("-")) {
-			out.filters.push(word);
-			continue;
-		}
-		const eq = word.indexOf("=");
-		const name = eq > 0 ? word.slice(0, eq) : word;
-		const base = name.replace(/\..*$/, "");
-		const spec = flags[name] ?? (base === "--coverage" ? flags["--coverage"] : void 0);
-		if (spec === void 0 || spec === "refuse") return { reason: `\`npm run ${script}\` passes ${name} to ${framework}, which the browser runner does not support.` };
-		let value = null;
-		if (eq > 0) value = word.slice(eq + 1);
-		else if (spec.takesValue) {
-			value = rest[i + 1] ?? null;
-			i++;
-			if (value === null) return { reason: `\`npm run ${script}\` passes ${name} without a value.` };
-		}
-		if (value !== null && spec.check) {
-			const problem = spec.check(value);
-			if (problem) return { reason: `\`npm run ${script}\` ${problem}, which the browser runner does not support.` };
-		}
-		if ((name === "-t" || name === "--testNamePattern") && value !== null) out.namePattern = value;
-		if ((name === "--testPathPattern" || name === "--testPathPatterns") && value !== null) out.filters.push(value);
-		if (name === "--testPathIgnorePatterns" && value !== null) out.ignore.push(value);
-		if (name === "--globals") out.globals = true;
-	}
-	return out;
-}
-function planFramework(files, framework, args, script) {
-	if (!hasDependency(files, framework)) return { reason: `\`npm run ${script}\` runs ${framework}, which package.json does not list as a dependency.` };
-	const parsed = parseFrameworkArgs(framework, args, script);
-	if ("reason" in parsed) return parsed;
-	const config = readTestConfig(files, framework);
-	if (!config.ok) return config;
-	if (parsed.namePattern !== null) try {
-		new RegExp(parsed.namePattern);
-	} catch {
-		return { reason: `\`npm run ${script}\` passes a test name pattern that is not a valid regular expression.` };
-	}
-	const include = config.include ?? (framework === "vitest" ? VITEST_DEFAULT : JEST_DEFAULT);
-	const matchPath = (re, path) => re.test(path) || framework === "jest" && re.test(`/${path}`);
-	let ignore;
-	try {
-		ignore = [...config.exclude, ...parsed.ignore.map((p) => new RegExp(p))];
-	} catch {
-		return { reason: `\`npm run ${script}\` passes an ignore pattern that is not a valid regular expression.` };
-	}
-	let entries = projectFiles(files).filter((p) => include.some((re) => matchPath(re, p)) && !ignore.some((re) => matchPath(re, p)) && !(framework === "vitest" && VITEST_EXCLUDE.test(p)));
-	if (parsed.filters.length) {
-		const filters = parsed.filters.map((f) => {
-			if (framework === "vitest") return (p) => p.includes(cleanPath(f));
-			try {
-				const re = new RegExp(f);
-				return (p) => re.test(`/${p}`);
-			} catch {
-				return (p) => p.includes(f);
-			}
-		});
-		entries = entries.filter((p) => filters.some((match) => match(p)));
-	}
-	return {
-		entries,
-		options: {
-			globals: framework === "jest" ? config.globals : config.globals || parsed.globals,
-			namePattern: parsed.namePattern,
-			testTimeout: config.testTimeout,
-			clearMocks: config.clearMocks || args.includes("--clearMocks"),
-			resetMocks: config.resetMocks || args.includes("--resetMocks") || args.includes("--mockReset"),
-			restoreMocks: config.restoreMocks || args.includes("--restoreMocks")
-		}
-	};
-}
-function planBrowserRun(files, script = "test") {
-	let scripts = {};
-	try {
-		scripts = JSON.parse(files["package.json"] ?? "{}").scripts ?? {};
-	} catch {
-		return {
-			ok: false,
-			reason: "package.json is not valid JSON."
-		};
-	}
-	const command = scripts[script];
-	if (typeof command !== "string" || !command.trim()) return {
-		ok: false,
-		reason: `package.json has no "${script}" script.`
-	};
-	const all = projectFiles(files);
-	const entries = [];
-	let framework = null;
-	let options = NODE_OPTIONS;
-	for (const segment of command.split("&&").map((s) => s.trim())) {
-		let argv = words(segment);
-		if (argv[0] === "cross-env") argv = argv.slice(1);
-		while (argv[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) argv = argv.slice(1);
-		if (argv[0] === "npx") argv = argv.slice(1);
-		while (argv[0] === "--no-install" || argv[0] === "--yes" || argv[0] === "-y") argv = argv.slice(1);
-		let bin = argv[0];
-		let rest = argv.slice(1);
-		if (bin === "node") {
-			const at = rest.findIndex((w) => !w.startsWith("-"));
-			const target = at >= 0 ? FRAMEWORK_BIN.exec(rest[at]) : null;
-			if (target) {
-				const unknown = rest.slice(0, at).filter((f) => f !== "--experimental-vm-modules").find((f) => !HARMLESS_FLAGS.test(f));
-				if (unknown) return {
-					ok: false,
-					reason: `\`npm run ${script}\` passes ${unknown} to Node, which the browser runner does not support.`
-				};
-				bin = target[1] ?? target[2] ?? target[3];
-				rest = rest.slice(at + 1);
-			}
-		}
-		if (bin === "vitest" || bin === "jest") {
-			if (framework !== null && framework !== bin) return {
-				ok: false,
-				reason: `\`npm run ${script}\` mixes ${framework} and ${bin}, which the browser runner does not support.`
-			};
-			framework = bin;
-			const planned = planFramework(files, bin, rest, script);
-			if ("reason" in planned) return {
-				ok: false,
-				reason: planned.reason
-			};
-			if (planned.entries.length === 0) return {
-				ok: false,
-				reason: `\`npm run ${script}\` matches no test files.`
-			};
-			options = planned.options;
-			for (const path of planned.entries) if (!entries.includes(path)) entries.push(path);
-			continue;
-		}
-		if (bin !== "node" && bin !== "tsx") return {
-			ok: false,
-			reason: `\`npm run ${script}\` runs ${bin ?? "nothing"}, which needs a real Node.`
-		};
-		if (framework !== null && framework !== "node") return {
-			ok: false,
-			reason: `\`npm run ${script}\` mixes ${framework} and ${bin}, which the browser runner does not support.`
-		};
-		framework = "node";
-		const flags = rest.filter((w) => w.startsWith("-"));
-		const unknown = flags.find((f) => !HARMLESS_FLAGS.test(f));
-		if (unknown) return {
-			ok: false,
-			reason: `\`npm run ${script}\` passes ${unknown} to Node, which the browser runner does not support.`
-		};
-		const args = rest.filter((w) => !w.startsWith("-"));
-		const testMode = flags.includes("--test");
-		if (!testMode && args.length !== 1) return {
-			ok: false,
-			reason: `\`${segment}\` does not name one file to run.`
-		};
-		const found = [];
-		if (args.length === 0) found.push(...all.filter((p) => DEFAULT_TEST_FILES.test(p)));
-		for (const arg of args) {
-			const path = cleanPath(arg);
-			if (/[*?{]/.test(path)) {
-				const re = globToRegExp(path);
-				found.push(...all.filter((p) => re.test(p)));
-			} else if (files[path] !== void 0) found.push(path);
-			else if (testMode && all.some((p) => p.startsWith(`${path}/`))) found.push(...all.filter((p) => p.startsWith(`${path}/`) && DEFAULT_TEST_FILES.test(p)));
-			else return {
-				ok: false,
-				reason: `\`npm run ${script}\` runs ${path}, which is not in the project.`
-			};
-		}
-		if (found.length === 0) return {
-			ok: false,
-			reason: `\`npm run ${script}\` matches no test files.`
-		};
-		for (const path of found) if (!entries.includes(path)) entries.push(path);
-	}
-	return {
-		ok: true,
-		script,
-		command,
-		entries,
-		framework: framework ?? "node",
-		options
-	};
-}
-/** Per rule, and for all the rules in one prompt. Rules are instructions, not documentation. */
-const RULE_LIMIT = {
-	chars: 2e3,
-	total: 6e3,
-	rules: 24
-};
-function isRulePath(path) {
-	return path.startsWith(".aperture/rules/") && /\.mdc?$/i.test(path) && !path.slice(16).includes("/");
-}
-function unquote(value) {
-	return value.trim().replace(/^(["'])(.*)\1$/, "$2").trim();
-}
-/** `a, b`, `"a, b"`, `"a", "b"` and `[a, "b"]` all name the same two patterns. */
-function splitGlobs(value) {
-	let inner = value.trim().replace(/^\[(.*)\]$/, "$1").trim();
-	const whole = /^(["'])([^"']*)\1$/.exec(inner);
-	if (whole) inner = whole[2];
-	return (inner.match(/"[^"]*"|'[^']*'|[^,]+/g) ?? []).map(unquote).filter(Boolean);
-}
-/** Front matter, then the rule. A file without front matter is a rule for every turn. */
-function parseRule(path, raw) {
-	const text = raw.replace(/\r\n/g, "\n");
-	const front = /^---\n([\s\S]*?)\n---[ \t]*(?:\n|$)/.exec(text);
-	const body = (front ? text.slice(front[0].length) : text).trim();
-	if (!body) return null;
-	const globs = [];
-	let description = "";
-	let always = false;
-	if (front) {
-		const lines = front[1].split("\n");
-		for (let i = 0; i < lines.length; i++) {
-			const match = /^([A-Za-z]+)\s*:\s*(.*)$/.exec(lines[i]);
-			if (!match) continue;
-			const key = match[1].toLowerCase();
-			const value = match[2];
-			if (key === "files" || key === "globs") {
-				if (value.trim()) globs.push(...splitGlobs(value));
-				while (i + 1 < lines.length && /^\s*-\s+/.test(lines[i + 1])) {
-					globs.push(unquote(lines[i + 1].replace(/^\s*-\s+/, "")));
-					i += 1;
-				}
-			} else if (key === "description") description = unquote(value);
-			else if (key === "alwaysapply") always = unquote(value) === "true";
-		}
-	}
-	return {
-		path,
-		globs: always ? [] : [...new Set(globs.filter(Boolean))],
-		description,
-		text: body.length > RULE_LIMIT.chars ? `${body.slice(0, RULE_LIMIT.chars)}\n… (rule cut at ${RULE_LIMIT.chars} characters)` : body
-	};
-}
-/** Every rule in `.aperture/rules/`, by file name. */
-function scopedRules(files) {
-	return Object.keys(files).filter(isRulePath).sort().slice(0, RULE_LIMIT.rules).map((path) => parseRule(path, files[path] ?? "")).filter((rule) => rule !== null);
-}
-const compiled = /* @__PURE__ */ new Map();
-function globMatches(glob, path) {
-	const clean = glob.replace(/^\.?\//, "");
-	if (!clean) return false;
-	let re = compiled.get(clean);
-	if (!re) {
-		re = globToRegExp(clean.endsWith("/") ? `${clean}**` : clean);
-		compiled.set(clean, re);
-	}
-	if (re.test(path)) return true;
-	return !clean.includes("/") && re.test(path.split("/").pop() ?? path);
-}
-/** The first path a rule is for, or null. A rule for every turn matches without a path. */
-function ruleMatch(rule, paths) {
-	for (const path of paths) if (rule.globs.some((glob) => globMatches(glob, path))) return path;
-	return null;
-}
-/** Rules for every turn, and the rules for any of these files. */
-function rulesForPaths(rules, paths) {
-	const out = [];
-	for (const rule of rules) {
-		if (rule.globs.length === 0) {
-			out.push({
-				rule,
-				matched: null
-			});
-			continue;
-		}
-		const matched = ruleMatch(rule, paths);
-		if (matched) out.push({
-			rule,
-			matched
-		});
-	}
-	return out;
-}
-function ruleBlock(rule, matched) {
-	const scope = matched ? `for ${rule.globs.join(", ")}; ${matched} matches` : "for every change";
-	return `### ${rule.path} (${scope})\n${rule.text}`;
-}
-/**
-* Hands rules to the agent once each, within the budget: the rules the turn
-* starts with, then any a file it reads or edits later brings in.
-*/
-var RuleLoader = class {
-	rules;
-	loaded = [];
-	used = 0;
-	constructor(files) {
-		this.rules = scopedRules(files);
-	}
-	take(found) {
-		const blocks = [];
-		for (const { rule, matched } of found) {
-			if (this.loaded.includes(rule.path)) continue;
-			const block = ruleBlock(rule, matched);
-			if (this.used + block.length > RULE_LIMIT.total) continue;
-			this.used += block.length;
-			this.loaded.push(rule.path);
-			blocks.push(block);
-		}
-		return blocks;
-	}
-	/** For the system prompt: rules for every turn, and those for the files the turn starts on. */
-	initial(paths) {
-		const blocks = this.take(rulesForPaths(this.rules, paths));
-		return blocks.length === 0 ? "" : `Project rules for the files in this task. Follow them:\n\n${blocks.join("\n\n")}`;
-	}
-	/** Appended to a tool result when the agent reaches a file a rule not yet loaded is for. */
-	forPath(path, after) {
-		const blocks = this.take(rulesForPaths(this.rules.filter((rule) => rule.globs.length > 0), [path]));
-		if (blocks.length === 0) return "";
-		return `\n\n${after === "edit" ? `A project rule applies to ${path}. Check the edit you just staged follows it; if not, fix it with propose_edit.` : `A project rule applies to ${path}. Follow it in any edit to this file.`}\n\n${blocks.join("\n\n")}`;
-	}
-};
 // src/lib/workspace/mentions.ts
 const CONTEXT_SOURCES = [{
 	path: "codebase",
