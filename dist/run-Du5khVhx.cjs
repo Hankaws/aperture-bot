@@ -154502,21 +154502,19 @@ function readAliases(files) {
 	}
 	return out;
 }
-function resolveInWorkspace(candidate, files) {
-	for (const ext of EXTENSIONS) {
-		const withExt = `${candidate}${ext}`;
-		if (files[withExt] !== void 0) return withExt;
-	}
+/** The paths an import of `candidate` could be, in the order resolution tries them. */
+function candidatePaths(candidate) {
+	const out = EXTENSIONS.map((ext) => `${candidate}${ext}`);
 	const compiled = /\.(?:m|c)?jsx?$/.exec(candidate)?.[0];
 	if (compiled) {
 		const stem = candidate.slice(0, -compiled.length);
-		for (const ext of SOURCE_FOR[compiled] ?? []) if (files[`${stem}${ext}`] !== void 0) return `${stem}${ext}`;
+		for (const ext of SOURCE_FOR[compiled] ?? []) out.push(`${stem}${ext}`);
 	}
-	for (const ext of EXTENSIONS.slice(1)) {
-		const index = `${candidate}/index${ext}`;
-		if (files[index] !== void 0) return index;
-	}
-	return null;
+	for (const ext of EXTENSIONS.slice(1)) out.push(`${candidate}/index${ext}`);
+	return out;
+}
+function resolveInWorkspace(candidate, files) {
+	return candidatePaths(candidate).find((path) => files[path] !== void 0) ?? null;
 }
 function resolveSpecifier(fromPath, rawSpec, files) {
 	const spec = rawSpec.split("?")[0];
